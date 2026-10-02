@@ -1,396 +1,338 @@
 #!/usr/bin/env bash
 
-set -u
+set -uo pipefail
 
-VERSION="1.0"
-
-# ------------------------------------------------------------
-# Deleted Data / Filesystem Remanence Scanner
-#
-# READ-ONLY:
-#   - Does not delete files
-#   - Does not modify filesystem data
-#   - Scans unallocated filesystem blocks where supported
-#
-# Usage:
-#   curl -fsSL https://raw.githubusercontent.com/USERNAME/REPO/main/scan.sh | sudo bash
-# ------------------------------------------------------------
-
-REPORT="/tmp/deleted-data-scan-$(date +%Y%m%d-%H%M%S).txt"
-TMPDIR="$(mktemp -d)"
+VERSION="2.0"
+REPORT="/tmp/file-recovery-check-$(date +%Y%m%d-%H%M%S).txt"
+WORKDIR="$(mktemp -d /tmp/file-recovery-check.XXXXXX)"
 
 cleanup() {
-    rm -rf "$TMPDIR"
+    rm -rf "$WORKDIR"
 }
 trap cleanup EXIT
 
-# ------------------------------------------------------------
-# Formatting
-# ------------------------------------------------------------
-
 line() {
-    printf '%*s\n' 70 '' | tr ' ' '='
+    printf '%*s\n' 72 '' | tr ' ' '='
 }
 
 section() {
     echo
     line
-    echo "  $1"
+    echo "$1"
     line
 }
 
-info() {
-    echo "[+] $1"
+human_size() {
+    if command -v numfmt >/dev/null 2>&1; then
+        numfmt --to=iec --suffix=B "$1"
+    else
+        echo "${1} bytes"
+    fi
 }
-
-warn() {
-    echo "[!] $1"
-}
-
-error() {
-    echo "[-] $1"
-}
-
-# ------------------------------------------------------------
-# Root check
-# ------------------------------------------------------------
 
 if [ "$(id -u)" -ne 0 ]; then
-    error "Please run as root."
+    echo "[ERROR] This script must be run as root."
     exit 1
 fi
-
-# ------------------------------------------------------------
-# OS detection
-# ------------------------------------------------------------
 
 if [ -f /etc/os-release ]; then
     . /etc/os-release
 else
-    error "Cannot determine Linux distribution."
+    echo "[ERROR] Cannot determine operating system."
     exit 1
 fi
 
-echo
+clear 2>/dev/null || true
+
 line
-echo "        Deleted Data / Remanence Scanner v$VERSION"
+echo "       FILE RECOVERY / STORAGE REMANENCE CHECK"
+echo "                      v$VERSION"
 line
 
 echo
-info "Operating system : ${PRETTY_NAME:-unknown}"
-info "Kernel            : $(uname -r)"
-info "Hostname          : $(hostname)"
-info "Date              : $(date)"
-info "Report            : $REPORT"
+echo "Host       : $(hostname)"
+echo "Date       : $(date)"
+echo "Kernel     : $(uname -r)"
+echo "OS         : ${PRETTY_NAME:-Unknown}"
+echo "Report     : $REPORT"
 
-# ------------------------------------------------------------
-# Install dependencies
-# ------------------------------------------------------------
+section "[1] Checking dependencies"
 
-section "Checking dependencies"
-
-install_packages() {
-
+install_sleuthkit() {
     case "${ID:-}" in
-
         ubuntu|debian)
             apt-get update -qq
-            apt-get install -y -qq sleuthkit util-linux file binutils
+            apt-get install -y -qq sleuthkit
             ;;
-
-        fedora)
-            dnf install -y sleuthkit util-linux file binutils
-            ;;
-
-        centos|rhel|rocky|almalinux)
+        fedora|rhel|centos|rocky|almalinux)
             if command -v dnf >/dev/null 2>&1; then
-                dnf install -y sleuthkit util-linux file binutils
+                dnf install -y sleuthkit
             else
-                yum install -y sleuthkit util-linux file binutils
+                yum install -y sleuthkit
             fi
             ;;
-
         arch)
-            pacman -Sy --noconfirm sleuthkit util-linux file binutils
+            pacman -Sy --noconfirm sleuthkit
             ;;
-
         *)
-            warn "Unsupported distribution: ${ID:-unknown}"
-            warn "Please install Sleuth Kit manually."
+            echo "[ERROR] Automatic installation is not supported for: ${ID:-unknown}"
+            return 1
             ;;
     esac
 }
 
 if ! command -v blkls >/dev/null 2>&1; then
-    warn "Sleuth Kit is not installed."
-    install_packages
+    echo "[INFO] Sleuth Kit is not installed."
+    echo "[INFO] Installing Sleuth Kit..."
+    install_sleuthkit || {
+        echo "[ERROR] Failed to install Sleuth Kit."
+        exit 1
+    }
 fi
 
-if ! command -v blkls >/dev/null 2>&1; then
-    error "blkls is still unavailable."
-    error "Cannot perform filesystem unallocated-space analysis."
-    exit 1
-fi
+REQUIRED_COMMANDS=(
+    blkls
+    lsblk
+    findmnt
+    df
+    strings
+    grep
+    awk
+    sed
+    stat
+)
 
-command -v strings >/dev/null 2>&1 || {
-    error "strings command is unavailable."
-    exit 1
-}
+for cmd in "${REQUIRED_COMMANDS[@]}"; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        echo "[ERROR] Required command not found: $cmd"
+        exit 1
+    fi
+done
 
-command -v lsblk >/dev/null 2>&1 || {
-    error "lsblk command is unavailable."
-    exit 1
-}
+echo "[OK] Required dependencies are available."
 
-info "Dependencies OK"
+section "[2] Block devices"
 
-# ------------------------------------------------------------
-# Disk information
-# ------------------------------------------------------------
-
-section "Detected block devices"
-
-lsblk -o NAME,PATH,SIZE,TYPE,FSTYPE,MOUNTPOINTS
-
-# ------------------------------------------------------------
-# Find root filesystem
-# ------------------------------------------------------------
+lsblk -e7 -o NAME,PATH,SIZE,TYPE,FSTYPE,MOUNTPOINTS
 
 ROOT_SOURCE="$(findmnt -n -o SOURCE / 2>/dev/null || true)"
+ROOT_FSTYPE="$(findmnt -n -o FSTYPE / 2>/dev/null || true)"
 
 if [ -z "$ROOT_SOURCE" ]; then
-    error "Could not determine root filesystem."
+    echo "[ERROR] Could not determine root filesystem."
     exit 1
 fi
 
 echo
-info "Root filesystem : $ROOT_SOURCE"
+echo "Root device : $ROOT_SOURCE"
+echo "Filesystem   : ${ROOT_FSTYPE:-unknown}"
 
-# Handle mapper devices and normal partitions
-SCAN_DEV="$ROOT_SOURCE"
+case "$ROOT_FSTYPE" in
+    ext2|ext3|ext4)
+        echo "[OK] EXT filesystem detected."
+        ;;
+    xfs)
+        echo "[WARNING] XFS detected."
+        echo "[WARNING] Deleted-data analysis may be limited."
+        ;;
+    btrfs)
+        echo "[WARNING] Btrfs detected."
+        echo "[WARNING] Copy-on-write and snapshots can affect results."
+        ;;
+    zfs)
+        echo "[WARNING] ZFS detected."
+        echo "[WARNING] This scanner is not designed for ZFS internals."
+        ;;
+    *)
+        echo "[WARNING] Filesystem '$ROOT_FSTYPE' may not be fully supported."
+        ;;
+esac
 
-if [[ "$SCAN_DEV" == /dev/mapper/* ]]; then
-    warn "Root filesystem is a device-mapper volume."
-    warn "Filesystem-level scanning will be attempted."
-fi
+section "[3] Current filesystem usage"
 
-# ------------------------------------------------------------
-# Filesystem information
-# ------------------------------------------------------------
+df -h "$ROOT_SOURCE"
 
-section "Filesystem information"
-
-findmnt /
-echo
-df -h /
-
-FSTYPE="$(lsblk -no FSTYPE "$SCAN_DEV" 2>/dev/null | head -n1)"
-
-if [ -z "$FSTYPE" ]; then
-    FSTYPE="$(blkid -o value -s TYPE "$SCAN_DEV" 2>/dev/null || true)"
-fi
-
-info "Filesystem type: ${FSTYPE:-unknown}"
-
-# ------------------------------------------------------------
-# Deleted-open files
-# ------------------------------------------------------------
-
-section "Deleted files still held open"
+section "[4] Deleted files still held open"
 
 if command -v lsof >/dev/null 2>&1; then
+    DELETED_OPEN="$(lsof +L1 2>/dev/null || true)"
 
-    OPEN_DELETED="$(lsof +L1 2>/dev/null || true)"
-
-    if [ -n "$OPEN_DELETED" ]; then
-        echo "$OPEN_DELETED"
+    if [ -n "$DELETED_OPEN" ]; then
+        echo "$DELETED_OPEN"
     else
-        echo "No deleted-but-open files detected."
+        echo "None detected."
     fi
-
 else
-    warn "lsof not installed; skipping open-deleted-file check."
+    echo "[INFO] lsof is not installed."
+    echo "[INFO] Skipping deleted-open-file check."
 fi
 
-# ------------------------------------------------------------
-# Calculate filesystem usage
-# ------------------------------------------------------------
+section "[5] Scanning unallocated filesystem space"
 
-section "Filesystem space analysis"
+UNALLOC="$WORKDIR/unallocated.bin"
+BLKLS_ERROR="$WORKDIR/blkls-error.txt"
 
-DF_USED="$(df -B1 "$SCAN_DEV" | awk 'NR==2 {print $3}')"
-DF_AVAIL="$(df -B1 "$SCAN_DEV" | awk 'NR==2 {print $4}')"
-DF_TOTAL="$(df -B1 "$SCAN_DEV" | awk 'NR==2 {print $2}')"
-
-echo "Filesystem total : $DF_TOTAL bytes"
-echo "Filesystem used  : $DF_USED bytes"
-echo "Filesystem free  : $DF_AVAIL bytes"
-
-# ------------------------------------------------------------
-# Scan unallocated space
-# ------------------------------------------------------------
-
-section "Scanning unallocated filesystem space"
-
-UNALLOC="$TMPDIR/unallocated.bin"
-
-info "Extracting unallocated blocks..."
-info "This can take time on large disks."
-
-if blkls "$SCAN_DEV" > "$UNALLOC" 2>/dev/null; then
-
-    UNALLOC_SIZE="$(stat -c%s "$UNALLOC" 2>/dev/null || echo 0)"
-
-    echo
-    info "Unallocated data exposed by filesystem: $UNALLOC_SIZE bytes"
-
-else
-
-    warn "blkls could not analyze $SCAN_DEV."
-    warn "This filesystem may not be supported or may be a virtual/device-mapper layout."
-    UNALLOC_SIZE=0
-fi
-
-# ------------------------------------------------------------
-# File signatures
-# ------------------------------------------------------------
-
-if [ "$UNALLOC_SIZE" -gt 0 ]; then
-
-    section "Detected file signatures"
-
-    file "$UNALLOC" 2>/dev/null | head -100
-
-    echo
-    info "Searching for common binary signatures..."
-
-    # JPEG
-    JPEG_COUNT="$(grep -aob $'\xFF\xD8\xFF' "$UNALLOC" 2>/dev/null | wc -l || true)"
-
-    # PDF
-    PDF_COUNT="$(grep -aob '％PDF-' "$UNALLOC" 2>/dev/null | wc -l || true)"
-
-    # ZIP
-    ZIP_COUNT="$(grep -aob 'PK\x03\x04' "$UNALLOC" 2>/dev/null | wc -l || true)"
-
-    # PNG
-    PNG_COUNT="$(grep -aob $'\x89PNG' "$UNALLOC" 2>/dev/null | wc -l || true)"
-
-    # GZIP
-    GZIP_COUNT="$(grep -aob $'\x1F\x8B' "$UNALLOC" 2>/dev/null | wc -l || true)"
-
-    echo "JPEG signatures : $JPEG_COUNT"
-    echo "PDF signatures  : $PDF_COUNT"
-    echo "ZIP signatures  : $ZIP_COUNT"
-    echo "PNG signatures  : $PNG_COUNT"
-    echo "GZIP signatures : $GZIP_COUNT"
-
-fi
-
-# ------------------------------------------------------------
-# Filename / path strings
-# ------------------------------------------------------------
-
-if [ "$UNALLOC_SIZE" -gt 0 ]; then
-
-    section "Recoverable-looking filenames and paths"
-
-    STRINGS_FILE="$TMPDIR/strings.txt"
-
-    strings -a -n 5 "$UNALLOC" > "$STRINGS_FILE" 2>/dev/null || true
-
-    grep -Eai \
-        '(^|/)[A-Za-z0-9._-]+\.(txt|log|conf|cfg|ini|json|xml|yaml|yml|csv|sql|db|sqlite|sqlite3|jpg|jpeg|png|gif|webp|bmp|pdf|doc|docx|xls|xlsx|ppt|pptx|zip|tar|gz|tgz|bz2|7z|rar|php|html|htm|js|ts|jsx|tsx|py|rb|go|java|c|cpp|h|hpp|sh|bash|env|key|pem|crt|cer|bak|old|tmp)$' \
-        "$STRINGS_FILE" |
-        sort -u |
-        head -1000
-
-fi
-
-# ------------------------------------------------------------
-# Interesting text fragments
-# ------------------------------------------------------------
-
-if [ "$UNALLOC_SIZE" -gt 0 ]; then
-
-    section "Interesting recovered text fragments"
-
-    grep -Eai \
-        '(password|passwd|secret|token|api[_-]?key|authorization|bearer|private[_-]?key|database|mysql|postgres|mongodb|redis|ssh|BEGIN [A-Z ]+ KEY)' \
-        "$STRINGS_FILE" |
-        sort -u |
-        head -500
-
-fi
-
-# ------------------------------------------------------------
-# Common filesystem artifacts
-# ------------------------------------------------------------
-
-if [ "$UNALLOC_SIZE" -gt 0 ]; then
-
-    section "Filesystem / application artifacts"
-
-    grep -Eai \
-        '(\/home\/|\/root\/|\/var\/www\/|\/etc\/|\/tmp\/|\/opt\/|\/srv\/|\.git\/|node_modules\/|\.ssh\/|docker|kubernetes)' \
-        "$STRINGS_FILE" |
-        sort -u |
-        head -1000
-
-fi
-
-# ------------------------------------------------------------
-# Recoverability summary
-# ------------------------------------------------------------
-
-section "Summary"
-
-echo "Filesystem       : $SCAN_DEV"
-echo "Filesystem type  : ${FSTYPE:-unknown}"
-echo "Unallocated data : $UNALLOC_SIZE bytes"
-
+echo "Device: $ROOT_SOURCE"
+echo
+echo "[INFO] Reading unallocated filesystem blocks..."
+echo "[INFO] This operation is read-only."
 echo
 
-if [ "$UNALLOC_SIZE" -gt 0 ]; then
+if blkls "$ROOT_SOURCE" > "$UNALLOC" 2>"$BLKLS_ERROR"; then
+    UNALLOC_SIZE="$(stat -c '%s' "$UNALLOC" 2>/dev/null || echo 0)"
 
-    echo "RESULT: Unallocated blocks containing residual data are accessible"
-    echo
-    echo "This indicates that data fragments exist in filesystem-unallocated"
-    echo "space. It does NOT prove that the data belongs to a previous"
-    echo "cloud/VPS customer."
-
+    echo "[OK] Unallocated data stream created."
+    echo "Size: $(human_size "$UNALLOC_SIZE")"
 else
+    echo "[ERROR] blkls could not analyze $ROOT_SOURCE."
 
-    echo "RESULT: No accessible unallocated data was detected."
+    if [ -s "$BLKLS_ERROR" ]; then
+        echo
+        cat "$BLKLS_ERROR"
+    fi
+
     echo
-    echo "This does NOT prove that physical storage contains no residual data."
-    echo "The provider may use virtualization, encryption, thin provisioning,"
-    echo "snapshots, or storage-layer isolation."
+    echo "The filesystem or storage layout may not be supported."
+    exit 1
+fi
+
+if [ "$UNALLOC_SIZE" -eq 0 ]; then
+    echo
+    echo "[RESULT] No unallocated data was exposed."
+    echo
+    echo "This does not prove that the underlying physical storage"
+    echo "contains no residual data."
+    exit 0
+fi
+
+section "[6] Searching readable strings"
+
+STRINGS_FILE="$WORKDIR/strings.txt"
+
+strings -a -t d -n 6 "$UNALLOC" > "$STRINGS_FILE" 2>/dev/null || true
+
+STRING_COUNT="$(wc -l < "$STRINGS_FILE" 2>/dev/null || echo 0)"
+
+echo "Readable strings found: $STRING_COUNT"
+
+section "[7] Searching filename candidates"
+
+FILENAME_FILE="$WORKDIR/filenames.txt"
+
+grep -Eai \
+'(^|[/[:space:]])[A-Za-z0-9._@/-]+\.(txt|log|conf|cfg|ini|json|xml|yaml|yml|csv|sql|db|sqlite|sqlite3|jpg|jpeg|png|gif|webp|bmp|pdf|doc|docx|xls|xlsx|ppt|pptx|zip|tar|gz|tgz|bz2|7z|rar|php|html|htm|js|ts|jsx|tsx|py|rb|go|java|c|cpp|h|hpp|sh|bash|env|key|pem|crt|cer|bak|old|tmp)([^A-Za-z0-9._-]|$)' \
+"$STRINGS_FILE" |
+sed -E 's/^[[:space:]]*[0-9]+:[[:space:]]*//' |
+sort -u |
+head -1000 > "$FILENAME_FILE"
+
+FILENAME_COUNT="$(wc -l < "$FILENAME_FILE" 2>/dev/null || echo 0)"
+
+if [ "$FILENAME_COUNT" -gt 0 ]; then
+    echo "Candidates found: $FILENAME_COUNT"
+    echo
+    cat "$FILENAME_FILE"
+else
+    echo "No obvious filename candidates found."
+fi
+
+section "[8] Searching file signatures"
+
+count_signature() {
+    local name="$1"
+    local pattern="$2"
+    local count
+
+    count="$(grep -aob "$pattern" "$UNALLOC" 2>/dev/null | wc -l || echo 0)"
+    printf "%-12s %s\n" "$name:" "$count"
+}
+
+count_signature "PDF" '%PDF-'
+count_signature "ZIP" 'PK'
+count_signature "GZIP" $'\x1f\x8b'
+count_signature "PNG" 'PNG'
+count_signature "JPEG" $'\xff\xd8\xff'
+count_signature "GIF" 'GIF8'
+count_signature "SQLite" 'SQLite format 3'
+count_signature "ELF" $'\x7fELF'
+
+section "[9] Searching interesting text"
+
+INTERESTING_FILE="$WORKDIR/interesting.txt"
+
+grep -Eai \
+'(password|passwd|secret|api[_-]?key|authorization|bearer|private[_-]?key|database|mysql|postgres|mongodb|redis|BEGIN [A-Z ]+ KEY|/home/|/root/|/var/www/|/etc/|/opt/|/srv/|\.ssh/|docker|kubernetes)' \
+"$STRINGS_FILE" |
+sort -u |
+head -1000 > "$INTERESTING_FILE"
+
+INTERESTING_COUNT="$(wc -l < "$INTERESTING_FILE" 2>/dev/null || echo 0)"
+
+if [ "$INTERESTING_COUNT" -gt 0 ]; then
+    echo "Candidates found: $INTERESTING_COUNT"
+    echo
+    cat "$INTERESTING_FILE"
+else
+    echo "No obvious interesting text candidates found."
+fi
+
+section "[10] Summary"
+
+echo "Root device              : $ROOT_SOURCE"
+echo "Filesystem               : ${ROOT_FSTYPE:-unknown}"
+echo "Unallocated data         : $(human_size "$UNALLOC_SIZE")"
+echo "Readable strings         : $STRING_COUNT"
+echo "Filename candidates      : $FILENAME_COUNT"
+echo "Interesting text         : $INTERESTING_COUNT"
+
+section "[11] Result"
+
+if [ "$FILENAME_COUNT" -gt 0 ] || [ "$INTERESTING_COUNT" -gt 0 ]; then
+    echo "POTENTIAL RESIDUAL DATA DETECTED"
+    echo
+    echo "File-like or readable remnants were found in"
+    echo "unallocated filesystem space."
+else
+    echo "NO OBVIOUS FILE REMNANTS DETECTED"
 fi
 
 echo
 echo "IMPORTANT:"
-echo "This scanner cannot determine previous ownership of recovered data."
-echo "Only a known canary/marker written before destroying a test VM can"
-echo "reliably establish that your old data survived VM reallocation."
-
-# ------------------------------------------------------------
-# Save report
-# ------------------------------------------------------------
+echo
+echo "This scanner cannot determine who previously owned"
+echo "the recovered data."
+echo
+echo "A positive result does not prove cross-tenant leakage."
+echo "A clean result does not prove secure physical erasure."
+echo
+echo "For a cross-tenant test, use a unique canary string"
+echo "on VPS A, destroy VPS A, create VPS B, and search"
+echo "VPS B for the exact same canary."
 
 {
-    echo "Deleted Data / Remanence Scanner"
+    echo "FILE RECOVERY / STORAGE REMANENCE CHECK"
     echo "Version: $VERSION"
     echo "Date: $(date)"
+    echo "Host: $(hostname)"
+    echo "Root device: $ROOT_SOURCE"
+    echo "Filesystem: $ROOT_FSTYPE"
     echo
-    echo "Device: $SCAN_DEV"
-    echo "Filesystem: ${FSTYPE:-unknown}"
-    echo "Unallocated bytes: $UNALLOC_SIZE"
+    echo "Unallocated data: $UNALLOC_SIZE bytes"
+    echo "Readable strings: $STRING_COUNT"
+    echo "Filename candidates: $FILENAME_COUNT"
+    echo "Interesting text candidates: $INTERESTING_COUNT"
+    echo
+    if [ "$FILENAME_COUNT" -gt 0 ] || [ "$INTERESTING_COUNT" -gt 0 ]; then
+        echo "Result: Potential residual data detected."
+    else
+        echo "Result: No obvious file remnants detected."
+    fi
 } > "$REPORT"
 
 echo
 line
-echo "Report metadata saved to:"
+echo "Report saved to:"
 echo "$REPORT"
 line
 echo
+echo "Scan complete."
