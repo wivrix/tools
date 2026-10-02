@@ -17,7 +17,7 @@
 
 set -uo pipefail
 
-VERSION="3.0"
+VERSION="3.1"
 
 WORKDIR="$(mktemp -d /tmp/file-recovery-check.XXXXXX)"
 REPORT="/tmp/file-recovery-check-$(date +%Y%m%d-%H%M%S).txt"
@@ -96,7 +96,11 @@ install_sleuthkit() {
     case "${ID:-}" in
         ubuntu|debian)
             echo "[INFO] Installing Sleuth Kit using apt..."
-            apt-get update -qq &&
+
+            if ! apt-get update -qq; then
+                return 1
+            fi
+
             apt-get install -y -qq sleuthkit
             ;;
 
@@ -104,9 +108,11 @@ install_sleuthkit() {
             if command -v dnf >/dev/null 2>&1; then
                 echo "[INFO] Installing Sleuth Kit using dnf..."
                 dnf install -y sleuthkit
+
             elif command -v yum >/dev/null 2>&1; then
                 echo "[INFO] Installing Sleuth Kit using yum..."
                 yum install -y sleuthkit
+
             else
                 return 1
             fi
@@ -147,9 +153,7 @@ grep
 awk
 sed
 sort
-uniq
 wc
-stat
 mktemp
 "
 
@@ -179,10 +183,14 @@ echo "Filesystem  : ${ROOT_FSTYPE:-unknown}"
 
 echo
 echo "Block devices:"
-lsblk -e7 -o NAME,PATH,SIZE,TYPE,FSTYPE,MOUNTPOINTS 2>/dev/null || true
+
+lsblk \
+    -e7 \
+    -o NAME,PATH,SIZE,TYPE,FSTYPE,MOUNTPOINTS \
+    2>/dev/null || true
 
 # ----------------------------------------------------------------------
-# Validate that the filesystem is something Sleuth Kit can inspect.
+# Validate filesystem source
 # ----------------------------------------------------------------------
 
 case "$ROOT_SOURCE" in
@@ -205,8 +213,11 @@ case "$ROOT_SOURCE" in
             echo "Version: $VERSION"
             echo "Date: $(date)"
             echo "Host: $(hostname)"
+            echo "Kernel: $(uname -r)"
+            echo "OS: ${PRETTY_NAME:-Unknown}"
+            echo
             echo "Root source: $ROOT_SOURCE"
-            echo "Filesystem: $ROOT_FSTYPE"
+            echo "Filesystem: ${ROOT_FSTYPE:-unknown}"
             echo
             echo "Result: Block-level scan not possible."
             echo "Reason: Root source is not a block device."
@@ -215,6 +226,10 @@ case "$ROOT_SOURCE" in
         exit 0
         ;;
 esac
+
+# ----------------------------------------------------------------------
+# Filesystem information
+# ----------------------------------------------------------------------
 
 case "$ROOT_FSTYPE" in
     ext2|ext3|ext4)
@@ -273,9 +288,10 @@ fi
 # ----------------------------------------------------------------------
 # Deleted filesystem entries
 #
-# fls -r -d:
+# fls:
 #   -r = recursive
 #   -d = deleted entries
+#   -l = long format
 #
 # We consume the complete output but save only the first MAX_FINDINGS
 # entries so a large filesystem does not create a huge report.
@@ -284,15 +300,18 @@ fi
 section "[5] Deleted filesystem entries"
 
 DELETED_FILE="$WORKDIR/deleted.txt"
+DELETED_ERROR="$WORKDIR/fls-error.txt"
 DELETED_COUNT=0
 
-if fls -r -d -l "$ROOT_SOURCE" 2>"$WORKDIR/fls-error.txt" |
+if fls -r -d -l "$ROOT_SOURCE" 2>"$DELETED_ERROR" |
     awk -v max="$MAX_FINDINGS" -v out="$DELETED_FILE" '
         {
             count++
+
             if (count <= max)
                 print $0 > out
         }
+
         END {
             print count
         }
@@ -300,6 +319,7 @@ if fls -r -d -l "$ROOT_SOURCE" 2>"$WORKDIR/fls-error.txt" |
 
     DELETED_COUNT="$(cat "$WORKDIR/deleted-count.txt" 2>/dev/null || echo 0)"
 else
+    echo "[WARNING] fls could not complete successfully."
     DELETED_COUNT=0
 fi
 
@@ -310,6 +330,7 @@ case "$DELETED_COUNT" in
 esac
 
 if [ "$DELETED_COUNT" -gt 0 ]; then
+
     echo "Deleted filesystem entries detected: $DELETED_COUNT"
 
     if [ "$DELETED_COUNT" -gt "$MAX_FINDINGS" ]; then
@@ -318,26 +339,27 @@ if [ "$DELETED_COUNT" -gt 0 ]; then
 
     echo
     cat "$DELETED_FILE" 2>/dev/null || true
+
 else
     echo "No deleted filesystem entries were reported."
 fi
 
-if [ -s "$WORKDIR/fls-error.txt" ]; then
+if [ -s "$DELETED_ERROR" ]; then
     echo
     echo "[INFO] fls reported:"
-    cat "$WORKDIR/fls-error.txt"
+    cat "$DELETED_ERROR"
 fi
 
 # ----------------------------------------------------------------------
 # Unallocated filesystem data
 #
-# IMPORTANT:
-# blkls writes the unallocated data stream to stdout.
+# blkls outputs unallocated filesystem data to stdout.
 #
-# We NEVER redirect it to a giant file.
+# IMPORTANT:
+# We NEVER redirect this stream into a large file.
 # ----------------------------------------------------------------------
 
-section "[6] Scanning unallocated filesystem data"
+section "[6] Measuring unallocated filesystem data"
 
 BLKLS_ERROR="$WORKDIR/blkls-error.txt"
 
@@ -379,22 +401,26 @@ fi
 # ----------------------------------------------------------------------
 # Readable strings
 #
-# Run blkls again, but stream directly into strings.
-# Only capped findings are saved.
+# blkls is streamed directly into strings.
+# Only the first MAX_FINDINGS strings are stored.
+# The counter still counts all strings processed.
 # ----------------------------------------------------------------------
 
 section "[7] Searching readable strings"
 
 STRINGS_FILE="$WORKDIR/strings.txt"
+STRING_COUNT=0
 
 if blkls "$ROOT_SOURCE" 2>/dev/null |
     strings -a -t d -n 6 2>/dev/null |
     awk -v max="$MAX_FINDINGS" -v out="$STRINGS_FILE" '
         {
             count++
+
             if (count <= max)
                 print $0 > out
         }
+
         END {
             print count
         }
@@ -402,6 +428,7 @@ if blkls "$ROOT_SOURCE" 2>/dev/null |
 
     STRING_COUNT="$(cat "$WORKDIR/string-count.txt" 2>/dev/null || echo 0)"
 else
+    echo "[WARNING] The unallocated-data string scan did not complete cleanly."
     STRING_COUNT=0
 fi
 
@@ -411,10 +438,10 @@ case "$STRING_COUNT" in
         ;;
 esac
 
-echo "Readable string records: $STRING_COUNT"
+echo "Readable string records processed: $STRING_COUNT"
 
 if [ "$STRING_COUNT" -gt "$MAX_FINDINGS" ]; then
-    echo "(Only the first $MAX_FINDINGS are retained.)"
+    echo "(Only the first $MAX_FINDINGS are retained for further analysis.)"
 fi
 
 # ----------------------------------------------------------------------
@@ -426,7 +453,7 @@ section "[8] Searching filename-like remnants"
 FILENAME_FILE="$WORKDIR/filenames.txt"
 
 grep -Eai \
-'(^|[/[:space:]])[A-Za-z0-9._@+/-]+\.(txt|log|conf|cfg|ini|json|xml|yaml|yml|csv|sql|db|sqlite|sqlite3|jpg|jpeg|png|gif|webp|bmp|pdf|doc|docx|xls|xlsx|ppt|pptx|zip|tar|gz|tgz|bz2|xz|7z|rar|php|html|htm|js|ts|jsx|tsx|py|rb|go|java|c|cpp|h|hpp|sh|bash|env|key|pem|crt|cer|bak|old|tmp)([^A-Za-z0-9._-]|$)' \
+'(^|[[:space:]/])[A-Za-z0-9._@+/-]+\.(txt|log|conf|cfg|ini|json|xml|yaml|yml|csv|sql|db|sqlite|sqlite3|jpg|jpeg|png|gif|webp|bmp|pdf|doc|docx|xls|xlsx|ppt|pptx|zip|tar|gz|tgz|bz2|xz|7z|rar|php|html|htm|js|ts|jsx|tsx|py|rb|go|java|c|cpp|h|hpp|sh|bash|env|key|pem|crt|cer|bak|old|tmp)([^A-Za-z0-9._-]|$)' \
 "$STRINGS_FILE" 2>/dev/null |
 sed -E 's/^[[:space:]]*[0-9]+:[[:space:]]*//' |
 sort -u |
@@ -434,8 +461,15 @@ head -n "$MAX_FINDINGS" > "$FILENAME_FILE" || true
 
 FILENAME_COUNT="$(wc -l < "$FILENAME_FILE" 2>/dev/null || echo 0)"
 
+case "$FILENAME_COUNT" in
+    ''|*[!0-9]*)
+        FILENAME_COUNT=0
+        ;;
+esac
+
 if [ "$FILENAME_COUNT" -gt 0 ]; then
-    echo "Filename-like candidates: $FILENAME_COUNT"
+
+    echo "Filename-like candidates retained: $FILENAME_COUNT"
 
     if [ "$FILENAME_COUNT" -ge "$MAX_FINDINGS" ]; then
         echo "(Output capped at $MAX_FINDINGS.)"
@@ -443,6 +477,7 @@ if [ "$FILENAME_COUNT" -gt 0 ]; then
 
     echo
     cat "$FILENAME_FILE"
+
 else
     echo "No obvious filename-like remnants found."
 fi
@@ -463,8 +498,15 @@ head -n "$MAX_INTERESTING" > "$INTERESTING_FILE" || true
 
 INTERESTING_COUNT="$(wc -l < "$INTERESTING_FILE" 2>/dev/null || echo 0)"
 
+case "$INTERESTING_COUNT" in
+    ''|*[!0-9]*)
+        INTERESTING_COUNT=0
+        ;;
+esac
+
 if [ "$INTERESTING_COUNT" -gt 0 ]; then
-    echo "Interesting-text candidates: $INTERESTING_COUNT"
+
+    echo "Interesting-text candidates retained: $INTERESTING_COUNT"
 
     if [ "$INTERESTING_COUNT" -ge "$MAX_INTERESTING" ]; then
         echo "(Output capped at $MAX_INTERESTING.)"
@@ -472,54 +514,16 @@ if [ "$INTERESTING_COUNT" -gt 0 ]; then
 
     echo
     cat "$INTERESTING_FILE"
+
 else
     echo "No obvious interesting-text remnants found."
 fi
 
 # ----------------------------------------------------------------------
-# File-signature hints
-#
-# These are ONLY hints. They are NOT recovered-file counts.
-# We intentionally use textual signatures that are safe to pass to grep.
-# ----------------------------------------------------------------------
-
-section "[10] File-signature hints"
-
-echo "[INFO] Signature matches are only indicators."
-echo "[INFO] They do NOT represent recovered-file counts."
-echo
-
-signature_count() {
-    local name="$1"
-    local pattern="$2"
-    local count
-
-    count="$(
-        blkls "$ROOT_SOURCE" 2>/dev/null |
-        grep -aobF "$pattern" 2>/dev/null |
-        wc -l
-    )"
-
-    case "$count" in
-        ''|*[!0-9]*)
-            count=0
-            ;;
-    esac
-
-    printf '%-12s %s\n' "$name:" "$count"
-}
-
-signature_count "PDF" '%PDF-'
-signature_count "PNG" 'PNG'
-signature_count "GIF" 'GIF8'
-signature_count "SQLite" 'SQLite format 3'
-signature_count "ELF" 'ELF'
-
-# ----------------------------------------------------------------------
 # Final result
 # ----------------------------------------------------------------------
 
-section "[11] Result"
+section "[10] Result"
 
 echo "Root source              : $ROOT_SOURCE"
 echo "Filesystem               : ${ROOT_FSTYPE:-unknown}"
@@ -540,7 +544,9 @@ if [ "$DELETED_COUNT" -gt 0 ] ||
     echo "readable data in unallocated filesystem space."
     echo
     echo "This is NOT proof of cross-tenant data leakage."
+
 else
+
     echo "RESULT: NO OBVIOUS RECOVERABLE REMNANTS DETECTED"
     echo
     echo "No obvious deleted entries or useful readable strings"
@@ -581,19 +587,24 @@ echo "Report: $REPORT"
     echo "Unallocated data: $UNALLOC_SIZE bytes"
     echo "Deleted entries: $DELETED_COUNT"
     echo "Readable string records: $STRING_COUNT"
-    echo "Filename candidates: $FILENAME_COUNT"
-    echo "Interesting text candidates: $INTERESTING_COUNT"
+    echo "Filename candidates retained: $FILENAME_COUNT"
+    echo "Interesting text candidates retained: $INTERESTING_COUNT"
     echo
     if [ "$DELETED_COUNT" -gt 0 ] ||
        [ "$FILENAME_COUNT" -gt 0 ] ||
        [ "$INTERESTING_COUNT" -gt 0 ]; then
+
         echo "Result: Potential residual data detected."
+
     else
+
         echo "Result: No obvious recoverable remnants detected."
     fi
+
     echo
     echo "This is a filesystem-level test."
     echo "It does not establish previous ownership or cross-tenant leakage."
+
 } > "$REPORT"
 
 echo
