@@ -1,26 +1,29 @@
 #!/usr/bin/env bash
 
-# ============================================================
-# File Recovery / Storage Remanence Check
-# Version: 3.0
-#
-# Purpose:
-#   Detect deleted-file metadata and recoverable-looking
-#   remnants in filesystem unallocated space.
+# file-recovery-check.sh
+# Filesystem-level storage remanence check for Linux VPS instances.
 #
 # IMPORTANT:
-#   A finding does NOT prove that the data belonged to a
-#   previous VPS/customer.
+# This checks the filesystem/device visible INSIDE the VPS.
+# It cannot prove or disprove residual data on the hosting provider's
+# underlying physical storage.
 #
-#   This tool performs READ-ONLY analysis.
-# ============================================================
+# For a real cross-tenant test:
+#   1. Write a unique canary to VPS A.
+#   2. Destroy/release VPS A.
+#   3. Provision VPS B.
+#   4. Run this scanner on VPS B.
+#   5. Search specifically for the canary.
 
 set -uo pipefail
 
 VERSION="3.0"
-MAX_FINDINGS=500
-REPORT="/tmp/file-recovery-check-$(date +%Y%m%d-%H%M%S).txt"
+
 WORKDIR="$(mktemp -d /tmp/file-recovery-check.XXXXXX)"
+REPORT="/tmp/file-recovery-check-$(date +%Y%m%d-%H%M%S).txt"
+
+MAX_FINDINGS=500
+MAX_INTERESTING=500
 
 cleanup() {
     rm -rf "$WORKDIR"
@@ -28,59 +31,54 @@ cleanup() {
 
 trap cleanup EXIT
 
-print_line() {
+line() {
     printf '%*s\n' 72 '' | tr ' ' '='
 }
 
 section() {
     echo
-    print_line
+    line
     echo "$1"
-    print_line
+    line
 }
 
 human_size() {
+    local bytes="$1"
+
     if command -v numfmt >/dev/null 2>&1; then
-        numfmt --to=iec --suffix=B "$1" 2>/dev/null
+        numfmt --to=iec --suffix=B "$bytes"
     else
-        echo "${1} bytes"
+        echo "${bytes} bytes"
     fi
 }
 
 fail() {
     echo
     echo "[ERROR] $1"
+    echo
     exit 1
 }
 
-# ------------------------------------------------------------
-# Root check
-# ------------------------------------------------------------
+# ----------------------------------------------------------------------
+# Basic checks
+# ----------------------------------------------------------------------
 
 if [ "$(id -u)" -ne 0 ]; then
     fail "This script must be run as root."
 fi
 
-# ------------------------------------------------------------
-# OS detection
-# ------------------------------------------------------------
-
 if [ ! -f /etc/os-release ]; then
-    fail "Cannot determine the Linux distribution."
+    fail "Cannot determine Linux distribution."
 fi
 
 # shellcheck disable=SC1091
 . /etc/os-release
 
-# ------------------------------------------------------------
-# Header
-# ------------------------------------------------------------
-
-print_line
+echo
+line
 echo "       FILE RECOVERY / STORAGE REMANENCE CHECK"
 echo "                         v$VERSION"
-print_line
-
+line
 echo
 echo "Host       : $(hostname)"
 echo "Date       : $(date)"
@@ -88,26 +86,26 @@ echo "Kernel     : $(uname -r)"
 echo "OS         : ${PRETTY_NAME:-Unknown}"
 echo "Report     : $REPORT"
 
-# ------------------------------------------------------------
-# Dependency installation
-# ------------------------------------------------------------
+# ----------------------------------------------------------------------
+# Dependencies
+# ----------------------------------------------------------------------
 
 section "[1] Checking dependencies"
 
 install_sleuthkit() {
     case "${ID:-}" in
         ubuntu|debian)
-            echo "[INFO] Installing Sleuth Kit..."
+            echo "[INFO] Installing Sleuth Kit using apt..."
             apt-get update -qq &&
-            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq sleuthkit
+            apt-get install -y -qq sleuthkit
             ;;
 
         fedora|rhel|centos|rocky|almalinux)
-            echo "[INFO] Installing Sleuth Kit..."
-
             if command -v dnf >/dev/null 2>&1; then
+                echo "[INFO] Installing Sleuth Kit using dnf..."
                 dnf install -y sleuthkit
             elif command -v yum >/dev/null 2>&1; then
+                echo "[INFO] Installing Sleuth Kit using yum..."
                 yum install -y sleuthkit
             else
                 return 1
@@ -115,12 +113,13 @@ install_sleuthkit() {
             ;;
 
         arch)
-            echo "[INFO] Installing Sleuth Kit..."
+            echo "[INFO] Installing Sleuth Kit using pacman..."
             pacman -Sy --noconfirm sleuthkit
             ;;
 
         *)
-            echo "[ERROR] Unsupported distribution: ${ID:-unknown}"
+            echo "[ERROR] Automatic Sleuth Kit installation is not supported for:"
+            echo "        ${PRETTY_NAME:-${ID:-unknown}}"
             return 1
             ;;
     esac
@@ -129,55 +128,93 @@ install_sleuthkit() {
 if ! command -v blkls >/dev/null 2>&1 ||
    ! command -v fls >/dev/null 2>&1; then
 
-    install_sleuthkit || fail "Could not install Sleuth Kit."
+    echo "[INFO] Sleuth Kit is not installed."
+    echo "[INFO] Attempting automatic installation..."
+
+    if ! install_sleuthkit; then
+        fail "Could not install Sleuth Kit automatically."
+    fi
 fi
 
-REQUIRED_COMMANDS=(
-    blkls
-    fls
-    lsblk
-    findmnt
-    df
-    strings
-    grep
-    awk
-    sed
-    sort
-    uniq
-    wc
-    stat
-)
+REQUIRED_COMMANDS="
+blkls
+fls
+lsblk
+findmnt
+df
+strings
+grep
+awk
+sed
+sort
+uniq
+wc
+stat
+mktemp
+"
 
-for cmd in "${REQUIRED_COMMANDS[@]}"; do
+for cmd in $REQUIRED_COMMANDS; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
         fail "Required command not found: $cmd"
     fi
 done
 
-echo "[OK] All required commands are available."
+echo "[OK] Required dependencies are available."
 
-# ------------------------------------------------------------
-# Block devices
-# ------------------------------------------------------------
+# ----------------------------------------------------------------------
+# Storage / filesystem detection
+# ----------------------------------------------------------------------
 
-section "[2] Block devices"
-
-lsblk -e7 -o NAME,PATH,SIZE,TYPE,FSTYPE,MOUNTPOINTS
-
-# ------------------------------------------------------------
-# Root filesystem
-# ------------------------------------------------------------
+section "[2] Detecting root filesystem"
 
 ROOT_SOURCE="$(findmnt -n -o SOURCE / 2>/dev/null || true)"
 ROOT_FSTYPE="$(findmnt -n -o FSTYPE / 2>/dev/null || true)"
 
 if [ -z "$ROOT_SOURCE" ]; then
-    fail "Could not determine the root filesystem."
+    fail "Could not determine the root filesystem source."
 fi
 
+echo "Root source : $ROOT_SOURCE"
+echo "Filesystem  : ${ROOT_FSTYPE:-unknown}"
+
 echo
-echo "Root device : $ROOT_SOURCE"
-echo "Filesystem   : ${ROOT_FSTYPE:-unknown}"
+echo "Block devices:"
+lsblk -e7 -o NAME,PATH,SIZE,TYPE,FSTYPE,MOUNTPOINTS 2>/dev/null || true
+
+# ----------------------------------------------------------------------
+# Validate that the filesystem is something Sleuth Kit can inspect.
+# ----------------------------------------------------------------------
+
+case "$ROOT_SOURCE" in
+    /dev/*)
+        ;;
+    *)
+        echo
+        echo "[WARNING] Root filesystem source is not a block device:"
+        echo "          $ROOT_SOURCE"
+        echo
+        echo "This commonly happens with containers/overlay filesystems."
+        echo "A block-level unallocated-space scan cannot be performed."
+        echo
+        echo "[RESULT] BLOCK-LEVEL SCAN NOT POSSIBLE"
+        echo
+        echo "Report: $REPORT"
+
+        {
+            echo "FILE RECOVERY / STORAGE REMANENCE CHECK"
+            echo "Version: $VERSION"
+            echo "Date: $(date)"
+            echo "Host: $(hostname)"
+            echo "Root source: $ROOT_SOURCE"
+            echo "Filesystem: $ROOT_FSTYPE"
+            echo
+            echo "Result: Block-level scan not possible."
+            echo "Reason: Root source is not a block device."
+        } > "$REPORT"
+
+        exit 0
+        ;;
+esac
 
 case "$ROOT_FSTYPE" in
     ext2|ext3|ext4)
@@ -186,35 +223,35 @@ case "$ROOT_FSTYPE" in
 
     xfs)
         echo "[WARNING] XFS detected."
-        echo "[WARNING] Deleted-file metadata may be limited."
+        echo "[WARNING] Deleted-file analysis may be limited."
         ;;
 
     btrfs)
         echo "[WARNING] Btrfs detected."
-        echo "[WARNING] Copy-on-write/snapshots affect interpretation."
+        echo "[WARNING] Copy-on-write/snapshots can affect interpretation."
         ;;
 
     zfs)
         echo "[WARNING] ZFS detected."
-        echo "[WARNING] This scanner does not analyze ZFS internals."
+        echo "[WARNING] This scanner is not designed for ZFS internals."
         ;;
 
     *)
-        echo "[WARNING] Filesystem '$ROOT_FSTYPE' may have limited support."
+        echo "[WARNING] Filesystem '$ROOT_FSTYPE' may not be fully supported."
         ;;
 esac
 
-# ------------------------------------------------------------
-# Filesystem usage
-# ------------------------------------------------------------
+# ----------------------------------------------------------------------
+# Current filesystem usage
+# ----------------------------------------------------------------------
 
 section "[3] Current filesystem usage"
 
-df -h "$ROOT_SOURCE"
+df -h "$ROOT_SOURCE" 2>/dev/null || df -h /
 
-# ------------------------------------------------------------
-# Deleted but open files
-# ------------------------------------------------------------
+# ----------------------------------------------------------------------
+# Deleted files still held open
+# ----------------------------------------------------------------------
 
 section "[4] Deleted files still held open"
 
@@ -230,121 +267,338 @@ if command -v lsof >/dev/null 2>&1; then
 
 else
     echo "[INFO] lsof is not installed."
-    echo "[INFO] This check is skipped."
+    echo "[INFO] Skipping deleted-open-file check."
 fi
 
-# ------------------------------------------------------------
+# ----------------------------------------------------------------------
 # Deleted filesystem entries
-# ------------------------------------------------------------
+#
+# fls -r -d:
+#   -r = recursive
+#   -d = deleted entries
+#
+# We consume the complete output but save only the first MAX_FINDINGS
+# entries so a large filesystem does not create a huge report.
+# ----------------------------------------------------------------------
 
 section "[5] Deleted filesystem entries"
 
-DELETED_FILE="$WORKDIR/deleted-files.txt"
-FLS_ERROR="$WORKDIR/fls-error.txt"
+DELETED_FILE="$WORKDIR/deleted.txt"
+DELETED_COUNT=0
 
-echo "[INFO] Searching filesystem metadata for deleted entries..."
-echo
+if fls -r -d -l "$ROOT_SOURCE" 2>"$WORKDIR/fls-error.txt" |
+    awk -v max="$MAX_FINDINGS" -v out="$DELETED_FILE" '
+        {
+            count++
+            if (count <= max)
+                print $0 > out
+        }
+        END {
+            print count
+        }
+    ' > "$WORKDIR/deleted-count.txt"; then
 
-if fls -r -d -l "$ROOT_SOURCE" > "$DELETED_FILE" 2>"$FLS_ERROR"; then
-
-    DELETED_COUNT="$(wc -l < "$DELETED_FILE" | tr -d ' ')"
-
-    if [ "$DELETED_COUNT" -gt 0 ]; then
-        echo "Deleted entries found: $DELETED_COUNT"
-        echo
-        head -n "$MAX_FINDINGS" "$DELETED_FILE"
-
-        if [ "$DELETED_COUNT" -gt "$MAX_FINDINGS" ]; then
-            echo
-            echo "... output limited to $MAX_FINDINGS entries."
-        fi
-    else
-        echo "No deleted filesystem entries reported by fls."
-    fi
-
+    DELETED_COUNT="$(cat "$WORKDIR/deleted-count.txt" 2>/dev/null || echo 0)"
 else
-
-    echo "[WARNING] fls could not analyze the filesystem."
-
-    if [ -s "$FLS_ERROR" ]; then
-        cat "$FLS_ERROR"
-    fi
-
     DELETED_COUNT=0
 fi
 
-# ------------------------------------------------------------
-# Unallocated-space size
-# ------------------------------------------------------------
+case "$DELETED_COUNT" in
+    ''|*[!0-9]*)
+        DELETED_COUNT=0
+        ;;
+esac
 
-section "[6] Unallocated filesystem data"
+if [ "$DELETED_COUNT" -gt 0 ]; then
+    echo "Deleted filesystem entries detected: $DELETED_COUNT"
 
-UNALLOC_SIZE_FILE="$WORKDIR/unallocated-size.txt"
+    if [ "$DELETED_COUNT" -gt "$MAX_FINDINGS" ]; then
+        echo "(Only the first $MAX_FINDINGS are shown.)"
+    fi
 
-echo "[INFO] Measuring unallocated filesystem data."
-echo "[INFO] No unallocated data is saved to disk."
+    echo
+    cat "$DELETED_FILE" 2>/dev/null || true
+else
+    echo "No deleted filesystem entries were reported."
+fi
 
-# blkls writes binary data to stdout.
-# wc counts the bytes while the data is streamed.
+if [ -s "$WORKDIR/fls-error.txt" ]; then
+    echo
+    echo "[INFO] fls reported:"
+    cat "$WORKDIR/fls-error.txt"
+fi
+
+# ----------------------------------------------------------------------
+# Unallocated filesystem data
 #
 # IMPORTANT:
-# This is a filesystem-level measurement, not physical
-# cloud-storage capacity.
+# blkls writes the unallocated data stream to stdout.
+#
+# We NEVER redirect it to a giant file.
+# ----------------------------------------------------------------------
 
-if blkls "$ROOT_SOURCE" 2>"$WORKDIR/blkls-size-error.txt" |
-   wc -c > "$UNALLOC_SIZE_FILE"; then
+section "[6] Scanning unallocated filesystem data"
 
-    UNALLOC_SIZE="$(cat "$UNALLOC_SIZE_FILE" | tr -d '[:space:]')"
+BLKLS_ERROR="$WORKDIR/blkls-error.txt"
 
-    if [ -z "$UNALLOC_SIZE" ]; then
-        UNALLOC_SIZE=0
-    fi
+echo "Device: $ROOT_SOURCE"
+echo
+echo "[INFO] Reading unallocated filesystem data..."
+echo "[INFO] No unallocated-data image will be created."
+echo "[INFO] This is a read-only operation."
+echo
 
-    echo "Unallocated data exposed by filesystem:"
-    echo "  $(human_size "$UNALLOC_SIZE")"
+UNALLOC_SIZE="$(
+    blkls "$ROOT_SOURCE" 2>"$BLKLS_ERROR" |
+    wc -c
+)"
 
-else
-
-    echo "[WARNING] Could not measure unallocated data."
-
-    if [ -s "$WORKDIR/blkls-size-error.txt" ]; then
-        cat "$WORKDIR/blkls-size-error.txt"
-    fi
-
+if [ -z "$UNALLOC_SIZE" ]; then
     UNALLOC_SIZE=0
 fi
 
-# ------------------------------------------------------------
-# String / filename analysis
-# ------------------------------------------------------------
+case "$UNALLOC_SIZE" in
+    ''|*[!0-9]*)
+        UNALLOC_SIZE=0
+        ;;
+esac
 
-section "[7] Searching unallocated space for readable remnants"
+if [ -s "$BLKLS_ERROR" ]; then
+    echo "[WARNING] blkls reported:"
+    cat "$BLKLS_ERROR"
+    echo
+fi
 
-STRING_FINDINGS="$WORKDIR/string-findings.txt"
-INTERESTING_FINDINGS="$WORKDIR/interesting-findings.txt"
+echo "Unallocated data stream: $(human_size "$UNALLOC_SIZE")"
 
-: > "$STRING_FINDINGS"
-: > "$INTERESTING_FINDINGS"
+if [ "$UNALLOC_SIZE" -eq 0 ]; then
+    echo
+    echo "[INFO] No unallocated filesystem data was exposed."
+fi
 
-echo "[INFO] Streaming unallocated data through strings."
-echo "[INFO] No complete unallocated image is stored."
+# ----------------------------------------------------------------------
+# Readable strings
+#
+# Run blkls again, but stream directly into strings.
+# Only capped findings are saved.
+# ----------------------------------------------------------------------
 
-# The awk process consumes the entire stream, but only saves
-# a limited number of interesting matches.
+section "[7] Searching readable strings"
 
-if blkls "$ROOT_SOURCE" 2>"$WORKDIR/blkls-strings-error.txt" |
-   strings -a -n 6 |
-   awk -v max="$MAX_FINDINGS" '
-   BEGIN {
-       total=0
-       files=0
-       interesting=0
-   }
+STRINGS_FILE="$WORKDIR/strings.txt"
 
-   {
-       total++
+if blkls "$ROOT_SOURCE" 2>/dev/null |
+    strings -a -t d -n 6 2>/dev/null |
+    awk -v max="$MAX_FINDINGS" -v out="$STRINGS_FILE" '
+        {
+            count++
+            if (count <= max)
+                print $0 > out
+        }
+        END {
+            print count
+        }
+    ' > "$WORKDIR/string-count.txt"; then
 
-       line=$0
+    STRING_COUNT="$(cat "$WORKDIR/string-count.txt" 2>/dev/null || echo 0)"
+else
+    STRING_COUNT=0
+fi
 
-       if (
-           line ~ /(^|[\/[:space:]])[^[:space:]]+\.(txt|log|conf|cfg|ini|json|xml|yaml|yml|csv|sql|db|sqlite|sqlite3|jpg|jpeg|png|gif|web
+case "$STRING_COUNT" in
+    ''|*[!0-9]*)
+        STRING_COUNT=0
+        ;;
+esac
+
+echo "Readable string records: $STRING_COUNT"
+
+if [ "$STRING_COUNT" -gt "$MAX_FINDINGS" ]; then
+    echo "(Only the first $MAX_FINDINGS are retained.)"
+fi
+
+# ----------------------------------------------------------------------
+# Filename-like strings
+# ----------------------------------------------------------------------
+
+section "[8] Searching filename-like remnants"
+
+FILENAME_FILE="$WORKDIR/filenames.txt"
+
+grep -Eai \
+'(^|[/[:space:]])[A-Za-z0-9._@+/-]+\.(txt|log|conf|cfg|ini|json|xml|yaml|yml|csv|sql|db|sqlite|sqlite3|jpg|jpeg|png|gif|webp|bmp|pdf|doc|docx|xls|xlsx|ppt|pptx|zip|tar|gz|tgz|bz2|xz|7z|rar|php|html|htm|js|ts|jsx|tsx|py|rb|go|java|c|cpp|h|hpp|sh|bash|env|key|pem|crt|cer|bak|old|tmp)([^A-Za-z0-9._-]|$)' \
+"$STRINGS_FILE" 2>/dev/null |
+sed -E 's/^[[:space:]]*[0-9]+:[[:space:]]*//' |
+sort -u |
+head -n "$MAX_FINDINGS" > "$FILENAME_FILE" || true
+
+FILENAME_COUNT="$(wc -l < "$FILENAME_FILE" 2>/dev/null || echo 0)"
+
+if [ "$FILENAME_COUNT" -gt 0 ]; then
+    echo "Filename-like candidates: $FILENAME_COUNT"
+
+    if [ "$FILENAME_COUNT" -ge "$MAX_FINDINGS" ]; then
+        echo "(Output capped at $MAX_FINDINGS.)"
+    fi
+
+    echo
+    cat "$FILENAME_FILE"
+else
+    echo "No obvious filename-like remnants found."
+fi
+
+# ----------------------------------------------------------------------
+# Interesting text
+# ----------------------------------------------------------------------
+
+section "[9] Searching interesting text"
+
+INTERESTING_FILE="$WORKDIR/interesting.txt"
+
+grep -Eai \
+'(password|passwd|secret|api[_-]?key|authorization|bearer|private[_-]?key|database|mysql|postgres|mongodb|redis|BEGIN [A-Z ]+ KEY|/home/|/root/|/var/www/|/etc/|/opt/|/srv/|\.ssh/|docker|kubernetes)' \
+"$STRINGS_FILE" 2>/dev/null |
+sort -u |
+head -n "$MAX_INTERESTING" > "$INTERESTING_FILE" || true
+
+INTERESTING_COUNT="$(wc -l < "$INTERESTING_FILE" 2>/dev/null || echo 0)"
+
+if [ "$INTERESTING_COUNT" -gt 0 ]; then
+    echo "Interesting-text candidates: $INTERESTING_COUNT"
+
+    if [ "$INTERESTING_COUNT" -ge "$MAX_INTERESTING" ]; then
+        echo "(Output capped at $MAX_INTERESTING.)"
+    fi
+
+    echo
+    cat "$INTERESTING_FILE"
+else
+    echo "No obvious interesting-text remnants found."
+fi
+
+# ----------------------------------------------------------------------
+# File-signature hints
+#
+# These are ONLY hints. They are NOT recovered-file counts.
+# We intentionally use textual signatures that are safe to pass to grep.
+# ----------------------------------------------------------------------
+
+section "[10] File-signature hints"
+
+echo "[INFO] Signature matches are only indicators."
+echo "[INFO] They do NOT represent recovered-file counts."
+echo
+
+signature_count() {
+    local name="$1"
+    local pattern="$2"
+    local count
+
+    count="$(
+        blkls "$ROOT_SOURCE" 2>/dev/null |
+        grep -aobF "$pattern" 2>/dev/null |
+        wc -l
+    )"
+
+    case "$count" in
+        ''|*[!0-9]*)
+            count=0
+            ;;
+    esac
+
+    printf '%-12s %s\n' "$name:" "$count"
+}
+
+signature_count "PDF" '%PDF-'
+signature_count "PNG" 'PNG'
+signature_count "GIF" 'GIF8'
+signature_count "SQLite" 'SQLite format 3'
+signature_count "ELF" 'ELF'
+
+# ----------------------------------------------------------------------
+# Final result
+# ----------------------------------------------------------------------
+
+section "[11] Result"
+
+echo "Root source              : $ROOT_SOURCE"
+echo "Filesystem               : ${ROOT_FSTYPE:-unknown}"
+echo "Unallocated data         : $(human_size "$UNALLOC_SIZE")"
+echo "Deleted entries          : $DELETED_COUNT"
+echo "Readable string records  : $STRING_COUNT"
+echo "Filename candidates      : $FILENAME_COUNT"
+echo "Interesting text         : $INTERESTING_COUNT"
+echo
+
+if [ "$DELETED_COUNT" -gt 0 ] ||
+   [ "$FILENAME_COUNT" -gt 0 ] ||
+   [ "$INTERESTING_COUNT" -gt 0 ]; then
+
+    echo "RESULT: POTENTIAL RESIDUAL DATA DETECTED"
+    echo
+    echo "The filesystem exposed deleted entries and/or"
+    echo "readable data in unallocated filesystem space."
+    echo
+    echo "This is NOT proof of cross-tenant data leakage."
+else
+    echo "RESULT: NO OBVIOUS RECOVERABLE REMNANTS DETECTED"
+    echo
+    echo "No obvious deleted entries or useful readable strings"
+    echo "were identified by this filesystem-level scan."
+fi
+
+echo
+echo "LIMITATIONS:"
+echo
+echo "1. This scanner only sees storage exposed to this VPS."
+echo "2. It cannot inspect provider-side physical storage."
+echo "3. It cannot identify the previous owner of residual data."
+echo "4. A clean result does not prove physical secure erasure."
+echo "5. A positive result does not prove cross-tenant leakage."
+echo "6. Live filesystem analysis can produce incomplete/inconsistent results."
+echo
+echo "For a true cross-tenant test:"
+echo "  VPS A -> write unique canary -> destroy VPS A"
+echo "  VPS B -> search for exact canary"
+echo
+echo "Report: $REPORT"
+
+# ----------------------------------------------------------------------
+# Save concise report
+# ----------------------------------------------------------------------
+
+{
+    echo "FILE RECOVERY / STORAGE REMANENCE CHECK"
+    echo "Version: $VERSION"
+    echo "Date: $(date)"
+    echo "Host: $(hostname)"
+    echo "Kernel: $(uname -r)"
+    echo "OS: ${PRETTY_NAME:-Unknown}"
+    echo
+    echo "Root source: $ROOT_SOURCE"
+    echo "Filesystem: ${ROOT_FSTYPE:-unknown}"
+    echo
+    echo "Unallocated data: $UNALLOC_SIZE bytes"
+    echo "Deleted entries: $DELETED_COUNT"
+    echo "Readable string records: $STRING_COUNT"
+    echo "Filename candidates: $FILENAME_COUNT"
+    echo "Interesting text candidates: $INTERESTING_COUNT"
+    echo
+    if [ "$DELETED_COUNT" -gt 0 ] ||
+       [ "$FILENAME_COUNT" -gt 0 ] ||
+       [ "$INTERESTING_COUNT" -gt 0 ]; then
+        echo "Result: Potential residual data detected."
+    else
+        echo "Result: No obvious recoverable remnants detected."
+    fi
+    echo
+    echo "This is a filesystem-level test."
+    echo "It does not establish previous ownership or cross-tenant leakage."
+} > "$REPORT"
+
+echo
+line
+echo "Scan complete."
+echo "Report saved to:"
+echo "$REPORT"
+line
