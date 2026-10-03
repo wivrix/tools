@@ -1,29 +1,42 @@
 #!/usr/bin/env bash
 
 # file-recovery-check.sh
-# Filesystem-level storage remanence check for Linux VPS instances.
+# General Linux deleted-file and storage recovery check.
 #
-# IMPORTANT:
-# This checks the filesystem/device visible INSIDE the VPS.
-# It cannot prove or disprove residual data on the hosting provider's
-# underlying physical storage.
+# This tool performs filesystem-level checks on storage that is
+# accessible from the current system.
 #
-# For a real cross-tenant test:
-#   1. Write a unique canary to VPS A.
-#   2. Destroy/release VPS A.
-#   3. Provision VPS B.
-#   4. Run this scanner on VPS B.
-#   5. Search specifically for the canary.
+# For overlay filesystems, the overlay mount itself is not a normal
+# filesystem device. The script therefore:
+#   - checks deleted-but-open files
+#   - identifies overlay upper/lower directories when available
+#   - checks the overlay upper directory when accessible
+#   - attempts backing-filesystem analysis when its block device
+#     can be safely identified
+#
+# No recovery image is created by this script.
 
 set -uo pipefail
 
-VERSION="3.1"
+VERSION="4.0"
 
 WORKDIR="$(mktemp -d /tmp/file-recovery-check.XXXXXX)"
 REPORT="/tmp/file-recovery-check-$(date +%Y%m%d-%H%M%S).txt"
 
 MAX_FINDINGS=500
 MAX_INTERESTING=500
+
+ROOT_SOURCE=""
+ROOT_FSTYPE=""
+SCAN_SOURCE=""
+SCAN_FSTYPE=""
+SCAN_REASON=""
+
+DELETED_COUNT=0
+STRING_COUNT=0
+FILENAME_COUNT=0
+INTERESTING_COUNT=0
+UNALLOC_SIZE=0
 
 cleanup() {
     rm -rf "$WORKDIR"
@@ -76,8 +89,8 @@ fi
 
 echo
 line
-echo "       FILE RECOVERY / STORAGE REMANENCE CHECK"
-echo "                         v$VERSION"
+echo "             FILE RECOVERY CHECK"
+echo "                     v$VERSION"
 line
 echo
 echo "Host       : $(hostname)"
@@ -166,10 +179,10 @@ done
 echo "[OK] Required dependencies are available."
 
 # ----------------------------------------------------------------------
-# Storage / filesystem detection
+# Root filesystem detection
 # ----------------------------------------------------------------------
 
-section "[2] Detecting root filesystem"
+section "[2] Detecting filesystem"
 
 ROOT_SOURCE="$(findmnt -n -o SOURCE / 2>/dev/null || true)"
 ROOT_FSTYPE="$(findmnt -n -o FSTYPE / 2>/dev/null || true)"
@@ -190,92 +203,22 @@ lsblk \
     2>/dev/null || true
 
 # ----------------------------------------------------------------------
-# Validate filesystem source
-# ----------------------------------------------------------------------
-
-case "$ROOT_SOURCE" in
-    /dev/*)
-        ;;
-    *)
-        echo
-        echo "[WARNING] Root filesystem source is not a block device:"
-        echo "          $ROOT_SOURCE"
-        echo
-        echo "This commonly happens with containers/overlay filesystems."
-        echo "A block-level unallocated-space scan cannot be performed."
-        echo
-        echo "[RESULT] BLOCK-LEVEL SCAN NOT POSSIBLE"
-        echo
-        echo "Report: $REPORT"
-
-        {
-            echo "FILE RECOVERY / STORAGE REMANENCE CHECK"
-            echo "Version: $VERSION"
-            echo "Date: $(date)"
-            echo "Host: $(hostname)"
-            echo "Kernel: $(uname -r)"
-            echo "OS: ${PRETTY_NAME:-Unknown}"
-            echo
-            echo "Root source: $ROOT_SOURCE"
-            echo "Filesystem: ${ROOT_FSTYPE:-unknown}"
-            echo
-            echo "Result: Block-level scan not possible."
-            echo "Reason: Root source is not a block device."
-        } > "$REPORT"
-
-        exit 0
-        ;;
-esac
-
-# ----------------------------------------------------------------------
-# Filesystem information
-# ----------------------------------------------------------------------
-
-case "$ROOT_FSTYPE" in
-    ext2|ext3|ext4)
-        echo "[OK] EXT filesystem detected."
-        ;;
-
-    xfs)
-        echo "[WARNING] XFS detected."
-        echo "[WARNING] Deleted-file analysis may be limited."
-        ;;
-
-    btrfs)
-        echo "[WARNING] Btrfs detected."
-        echo "[WARNING] Copy-on-write/snapshots can affect interpretation."
-        ;;
-
-    zfs)
-        echo "[WARNING] ZFS detected."
-        echo "[WARNING] This scanner is not designed for ZFS internals."
-        ;;
-
-    *)
-        echo "[WARNING] Filesystem '$ROOT_FSTYPE' may not be fully supported."
-        ;;
-esac
-
-# ----------------------------------------------------------------------
-# Current filesystem usage
-# ----------------------------------------------------------------------
-
-section "[3] Current filesystem usage"
-
-df -h "$ROOT_SOURCE" 2>/dev/null || df -h /
-
-# ----------------------------------------------------------------------
 # Deleted files still held open
+#
+# This check is independent of the filesystem type and therefore also
+# works when the root filesystem is overlay.
 # ----------------------------------------------------------------------
 
-section "[4] Deleted files still held open"
+section "[3] Deleted files still held open"
+
+DELETED_OPEN_FILE="$WORKDIR/deleted-open.txt"
 
 if command -v lsof >/dev/null 2>&1; then
 
-    DELETED_OPEN="$(lsof +L1 2>/dev/null || true)"
+    lsof +L1 2>/dev/null > "$DELETED_OPEN_FILE" || true
 
-    if [ -n "$DELETED_OPEN" ]; then
-        echo "$DELETED_OPEN"
+    if [ -s "$DELETED_OPEN_FILE" ]; then
+        cat "$DELETED_OPEN_FILE"
     else
         echo "None detected."
     fi
@@ -286,6 +229,183 @@ else
 fi
 
 # ----------------------------------------------------------------------
+# Overlay detection
+# ----------------------------------------------------------------------
+
+if [ "$ROOT_FSTYPE" = "overlay" ]; then
+
+    section "[4] Overlay filesystem"
+
+    echo "[INFO] The root filesystem is overlayfs."
+    echo "[INFO] The overlay mount itself is not scanned as a block filesystem."
+
+    OVERLAY_OPTIONS="$(
+        findmnt -n -o OPTIONS / 2>/dev/null || true
+    )"
+
+    UPPER_DIR=""
+    LOWER_DIRS=""
+
+    case ",$OVERLAY_OPTIONS," in
+        *,upperdir=*,*)
+            UPPER_DIR="$(
+                printf '%s\n' "$OVERLAY_OPTIONS" |
+                sed -n 's/.*,\?upperdir=\([^,]*\).*/\1/p' |
+                head -n 1
+            )"
+            ;;
+    esac
+
+    case ",$OVERLAY_OPTIONS," in
+        *,lowerdir=*,*)
+            LOWER_DIRS="$(
+                printf '%s\n' "$OVERLAY_OPTIONS" |
+                sed -n 's/.*,\?lowerdir=\([^,]*\).*/\1/p' |
+                head -n 1
+            )"
+            ;;
+    esac
+
+    if [ -n "$UPPER_DIR" ]; then
+        echo "Upper directory: $UPPER_DIR"
+    else
+        echo "Upper directory: not exposed"
+    fi
+
+    if [ -n "$LOWER_DIRS" ]; then
+        echo "Lower directory: $LOWER_DIRS"
+    else
+        echo "Lower directory: not exposed"
+    fi
+
+    # --------------------------------------------------------------
+    # Inspect the upper directory when accessible.
+    #
+    # This can show the actual files currently present in the upper
+    # layer, but cannot recover blocks that have already been deleted
+    # from that filesystem.
+    # --------------------------------------------------------------
+
+    if [ -n "$UPPER_DIR" ] && [ -d "$UPPER_DIR" ]; then
+
+        echo
+        echo "[INFO] Overlay upper directory is accessible."
+
+        UPPER_MOUNT_SOURCE="$(
+            findmnt -n -T "$UPPER_DIR" -o SOURCE 2>/dev/null || true
+        )"
+
+        UPPER_MOUNT_FSTYPE="$(
+            findmnt -n -T "$UPPER_DIR" -o FSTYPE 2>/dev/null || true
+        )"
+
+        echo "Upper backing source : ${UPPER_MOUNT_SOURCE:-unknown}"
+        echo "Upper filesystem     : ${UPPER_MOUNT_FSTYPE:-unknown}"
+
+        if [ -n "$UPPER_MOUNT_SOURCE" ] &&
+           [ -b "$UPPER_MOUNT_SOURCE" ]; then
+
+            SCAN_SOURCE="$UPPER_MOUNT_SOURCE"
+            SCAN_FSTYPE="$UPPER_MOUNT_FSTYPE"
+            SCAN_REASON="overlay upper directory backing device"
+
+            echo
+            echo "[OK] A block device backing the overlay upper directory was found."
+            echo "[INFO] Filesystem-level recovery analysis can be attempted."
+
+        else
+            echo
+            echo "[INFO] The overlay upper directory does not expose a"
+            echo "       directly accessible block device."
+            echo "[INFO] Deleted filesystem entries cannot be analyzed"
+            echo "       directly from the overlay mount."
+        fi
+
+    else
+        echo
+        echo "[INFO] Overlay upper directory is not accessible."
+    fi
+
+else
+
+    # ------------------------------------------------------------------
+    # Normal block-backed filesystem
+    # ------------------------------------------------------------------
+
+    case "$ROOT_SOURCE" in
+        /dev/*)
+            if [ -b "$ROOT_SOURCE" ]; then
+                SCAN_SOURCE="$ROOT_SOURCE"
+                SCAN_FSTYPE="$ROOT_FSTYPE"
+                SCAN_REASON="root filesystem"
+            fi
+            ;;
+    esac
+
+fi
+
+# ----------------------------------------------------------------------
+# Filesystem information
+# ----------------------------------------------------------------------
+
+section "[5] Filesystem analysis target"
+
+if [ -n "$SCAN_SOURCE" ]; then
+
+    echo "Scan source : $SCAN_SOURCE"
+    echo "Filesystem  : ${SCAN_FSTYPE:-unknown}"
+    echo "Reason      : $SCAN_REASON"
+
+    case "$SCAN_FSTYPE" in
+        ext2|ext3|ext4)
+            echo "[OK] EXT filesystem detected."
+            ;;
+
+        xfs)
+            echo "[WARNING] XFS detected."
+            echo "[WARNING] Deleted-file analysis may be limited."
+            ;;
+
+        btrfs)
+            echo "[WARNING] Btrfs detected."
+            echo "[WARNING] Copy-on-write/snapshots can affect interpretation."
+            ;;
+
+        zfs)
+            echo "[WARNING] ZFS detected."
+            echo "[WARNING] This tool is not designed for ZFS internals."
+            ;;
+
+        *)
+            echo "[WARNING] Filesystem '$SCAN_FSTYPE' may not be fully supported."
+            ;;
+    esac
+
+else
+
+    echo "No directly accessible block filesystem was identified."
+    echo
+    echo "Filesystem-level deleted-entry and unallocated-space analysis"
+    echo "will be skipped."
+    echo
+    echo "Other applicable checks will continue."
+
+fi
+
+# ----------------------------------------------------------------------
+# Current filesystem usage
+# ----------------------------------------------------------------------
+
+section "[6] Current filesystem usage"
+
+df -h / 2>/dev/null || true
+
+if [ -n "$SCAN_SOURCE" ]; then
+    echo
+    df -h "$SCAN_SOURCE" 2>/dev/null || true
+fi
+
+# ----------------------------------------------------------------------
 # Deleted filesystem entries
 #
 # fls:
@@ -293,171 +413,195 @@ fi
 #   -d = deleted entries
 #   -l = long format
 #
-# We consume the complete output but save only the first MAX_FINDINGS
-# entries so a large filesystem does not create a huge report.
+# Sleuth Kit can expose deleted names and orphan metadata, but deleted
+# entries must be interpreted carefully.
 # ----------------------------------------------------------------------
 
-section "[5] Deleted filesystem entries"
+section "[7] Deleted filesystem entries"
 
 DELETED_FILE="$WORKDIR/deleted.txt"
 DELETED_ERROR="$WORKDIR/fls-error.txt"
-DELETED_COUNT=0
 
-if fls -r -d -l "$ROOT_SOURCE" 2>"$DELETED_ERROR" |
-    awk -v max="$MAX_FINDINGS" -v out="$DELETED_FILE" '
-        {
-            count++
+if [ -n "$SCAN_SOURCE" ]; then
 
-            if (count <= max)
-                print $0 > out
-        }
+    if fls -r -d -l "$SCAN_SOURCE" 2>"$DELETED_ERROR" |
+        awk -v max="$MAX_FINDINGS" -v out="$DELETED_FILE" '
+            {
+                count++
 
-        END {
-            print count
-        }
-    ' > "$WORKDIR/deleted-count.txt"; then
+                if (count <= max)
+                    print $0 > out
+            }
 
-    DELETED_COUNT="$(cat "$WORKDIR/deleted-count.txt" 2>/dev/null || echo 0)"
-else
-    echo "[WARNING] fls could not complete successfully."
-    DELETED_COUNT=0
-fi
+            END {
+                print count
+            }
+        ' > "$WORKDIR/deleted-count.txt"; then
 
-case "$DELETED_COUNT" in
-    ''|*[!0-9]*)
+        DELETED_COUNT="$(
+            cat "$WORKDIR/deleted-count.txt" 2>/dev/null || echo 0
+        )"
+
+    else
+
+        echo "[WARNING] fls could not complete successfully."
         DELETED_COUNT=0
-        ;;
-esac
-
-if [ "$DELETED_COUNT" -gt 0 ]; then
-
-    echo "Deleted filesystem entries detected: $DELETED_COUNT"
-
-    if [ "$DELETED_COUNT" -gt "$MAX_FINDINGS" ]; then
-        echo "(Only the first $MAX_FINDINGS are shown.)"
     fi
 
-    echo
-    cat "$DELETED_FILE" 2>/dev/null || true
+    case "$DELETED_COUNT" in
+        ''|*[!0-9]*)
+            DELETED_COUNT=0
+            ;;
+    esac
+
+    if [ "$DELETED_COUNT" -gt 0 ]; then
+
+        echo "Deleted filesystem entries detected: $DELETED_COUNT"
+
+        if [ "$DELETED_COUNT" -gt "$MAX_FINDINGS" ]; then
+            echo "(Only the first $MAX_FINDINGS are shown.)"
+        fi
+
+        echo
+        cat "$DELETED_FILE" 2>/dev/null || true
+
+    else
+
+        echo "No deleted filesystem entries were reported."
+
+    fi
+
+    if [ -s "$DELETED_ERROR" ]; then
+        echo
+        echo "[INFO] fls reported:"
+        cat "$DELETED_ERROR"
+    fi
 
 else
-    echo "No deleted filesystem entries were reported."
-fi
 
-if [ -s "$DELETED_ERROR" ]; then
-    echo
-    echo "[INFO] fls reported:"
-    cat "$DELETED_ERROR"
+    echo "Skipped: no directly accessible block filesystem."
+
 fi
 
 # ----------------------------------------------------------------------
 # Unallocated filesystem data
 #
-# blkls outputs unallocated filesystem data to stdout.
-#
-# IMPORTANT:
-# We NEVER redirect this stream into a large file.
+# blkls streams unallocated filesystem data.
+# Nothing is written to a large recovery image.
 # ----------------------------------------------------------------------
 
-section "[6] Measuring unallocated filesystem data"
+section "[8] Measuring unallocated filesystem data"
 
 BLKLS_ERROR="$WORKDIR/blkls-error.txt"
 
-echo "Device: $ROOT_SOURCE"
-echo
-echo "[INFO] Reading unallocated filesystem data..."
-echo "[INFO] No unallocated-data image will be created."
-echo "[INFO] This is a read-only operation."
-echo
+if [ -n "$SCAN_SOURCE" ]; then
 
-UNALLOC_SIZE="$(
-    blkls "$ROOT_SOURCE" 2>"$BLKLS_ERROR" |
-    wc -c
-)"
-
-if [ -z "$UNALLOC_SIZE" ]; then
-    UNALLOC_SIZE=0
-fi
-
-case "$UNALLOC_SIZE" in
-    ''|*[!0-9]*)
-        UNALLOC_SIZE=0
-        ;;
-esac
-
-if [ -s "$BLKLS_ERROR" ]; then
-    echo "[WARNING] blkls reported:"
-    cat "$BLKLS_ERROR"
+    echo "Device: $SCAN_SOURCE"
     echo
-fi
-
-echo "Unallocated data stream: $(human_size "$UNALLOC_SIZE")"
-
-if [ "$UNALLOC_SIZE" -eq 0 ]; then
+    echo "[INFO] Reading unallocated filesystem data..."
+    echo "[INFO] No recovery image will be created."
     echo
-    echo "[INFO] No unallocated filesystem data was exposed."
+
+    UNALLOC_SIZE="$(
+        blkls "$SCAN_SOURCE" 2>"$BLKLS_ERROR" |
+        wc -c
+    )"
+
+    case "$UNALLOC_SIZE" in
+        ''|*[!0-9]*)
+            UNALLOC_SIZE=0
+            ;;
+    esac
+
+    echo "Unallocated data stream: $(human_size "$UNALLOC_SIZE")"
+
+    if [ -s "$BLKLS_ERROR" ]; then
+        echo
+        echo "[WARNING] blkls reported:"
+        cat "$BLKLS_ERROR"
+    fi
+
+else
+
+    echo "Skipped: no directly accessible block filesystem."
+
 fi
 
 # ----------------------------------------------------------------------
-# Readable strings
-#
-# blkls is streamed directly into strings.
-# Only the first MAX_FINDINGS strings are stored.
-# The counter still counts all strings processed.
+# Readable strings from unallocated space
 # ----------------------------------------------------------------------
 
-section "[7] Searching readable strings"
+section "[9] Searching readable strings"
 
 STRINGS_FILE="$WORKDIR/strings.txt"
-STRING_COUNT=0
 
-if blkls "$ROOT_SOURCE" 2>/dev/null |
-    strings -a -t d -n 6 2>/dev/null |
-    awk -v max="$MAX_FINDINGS" -v out="$STRINGS_FILE" '
-        {
-            count++
+if [ -n "$SCAN_SOURCE" ]; then
 
-            if (count <= max)
-                print $0 > out
-        }
+    if blkls "$SCAN_SOURCE" 2>/dev/null |
+        strings -a -t d -n 6 2>/dev/null |
+        awk -v max="$MAX_FINDINGS" -v out="$STRINGS_FILE" '
+            {
+                count++
 
-        END {
-            print count
-        }
-    ' > "$WORKDIR/string-count.txt"; then
+                if (count <= max)
+                    print $0 > out
+            }
 
-    STRING_COUNT="$(cat "$WORKDIR/string-count.txt" 2>/dev/null || echo 0)"
-else
-    echo "[WARNING] The unallocated-data string scan did not complete cleanly."
-    STRING_COUNT=0
-fi
+            END {
+                print count
+            }
+        ' > "$WORKDIR/string-count.txt"; then
 
-case "$STRING_COUNT" in
-    ''|*[!0-9]*)
+        STRING_COUNT="$(
+            cat "$WORKDIR/string-count.txt" 2>/dev/null || echo 0
+        )"
+
+    else
+
+        echo "[WARNING] Unallocated string scan did not complete cleanly."
         STRING_COUNT=0
-        ;;
-esac
+    fi
 
-echo "Readable string records processed: $STRING_COUNT"
+    case "$STRING_COUNT" in
+        ''|*[!0-9]*)
+            STRING_COUNT=0
+            ;;
+    esac
 
-if [ "$STRING_COUNT" -gt "$MAX_FINDINGS" ]; then
-    echo "(Only the first $MAX_FINDINGS are retained for further analysis.)"
+    echo "Readable string records processed: $STRING_COUNT"
+
+    if [ "$STRING_COUNT" -gt "$MAX_FINDINGS" ]; then
+        echo "(Only the first $MAX_FINDINGS are retained.)"
+    fi
+
+else
+
+    echo "Skipped: no directly accessible block filesystem."
+
 fi
 
 # ----------------------------------------------------------------------
 # Filename-like strings
 # ----------------------------------------------------------------------
 
-section "[8] Searching filename-like remnants"
+section "[10] Searching filename-like remnants"
 
 FILENAME_FILE="$WORKDIR/filenames.txt"
 
-grep -Eai \
-'(^|[[:space:]/])[A-Za-z0-9._@+/-]+\.(txt|log|conf|cfg|ini|json|xml|yaml|yml|csv|sql|db|sqlite|sqlite3|jpg|jpeg|png|gif|webp|bmp|pdf|doc|docx|xls|xlsx|ppt|pptx|zip|tar|gz|tgz|bz2|xz|7z|rar|php|html|htm|js|ts|jsx|tsx|py|rb|go|java|c|cpp|h|hpp|sh|bash|env|key|pem|crt|cer|bak|old|tmp)([^A-Za-z0-9._-]|$)' \
-"$STRINGS_FILE" 2>/dev/null |
-sed -E 's/^[[:space:]]*[0-9]+:[[:space:]]*//' |
-sort -u |
-head -n "$MAX_FINDINGS" > "$FILENAME_FILE" || true
+if [ -s "$STRINGS_FILE" ]; then
+
+    grep -Eai \
+    '(^|[[:space:]/])[A-Za-z0-9._@+/-]+\.(txt|log|conf|cfg|ini|json|xml|yaml|yml|csv|sql|db|sqlite|sqlite3|jpg|jpeg|png|gif|webp|bmp|pdf|doc|docx|xls|xlsx|ppt|pptx|zip|tar|gz|tgz|bz2|xz|7z|rar|php|html|htm|js|ts|jsx|tsx|py|rb|go|java|c|cpp|h|hpp|sh|bash|env|key|pem|crt|cer|bak|old|tmp)([^A-Za-z0-9._-]|$)' \
+    "$STRINGS_FILE" 2>/dev/null |
+    sed -E 's/^[[:space:]]*[0-9]+:[[:space:]]*//' |
+    sort -u |
+    head -n "$MAX_FINDINGS" > "$FILENAME_FILE" || true
+
+else
+
+    : > "$FILENAME_FILE"
+
+fi
 
 FILENAME_COUNT="$(wc -l < "$FILENAME_FILE" 2>/dev/null || echo 0)"
 
@@ -479,22 +623,32 @@ if [ "$FILENAME_COUNT" -gt 0 ]; then
     cat "$FILENAME_FILE"
 
 else
+
     echo "No obvious filename-like remnants found."
+
 fi
 
 # ----------------------------------------------------------------------
 # Interesting text
 # ----------------------------------------------------------------------
 
-section "[9] Searching interesting text"
+section "[11] Searching interesting text"
 
 INTERESTING_FILE="$WORKDIR/interesting.txt"
 
-grep -Eai \
-'(password|passwd|secret|api[_-]?key|authorization|bearer|private[_-]?key|database|mysql|postgres|mongodb|redis|BEGIN [A-Z ]+ KEY|/home/|/root/|/var/www/|/etc/|/opt/|/srv/|\.ssh/|docker|kubernetes)' \
-"$STRINGS_FILE" 2>/dev/null |
-sort -u |
-head -n "$MAX_INTERESTING" > "$INTERESTING_FILE" || true
+if [ -s "$STRINGS_FILE" ]; then
+
+    grep -Eai \
+    '(password|passwd|secret|api[_-]?key|authorization|bearer|private[_-]?key|database|mysql|postgres|mongodb|redis|BEGIN [A-Z ]+ KEY|/home/|/root/|/var/www/|/etc/|/opt/|/srv/|\.ssh/|docker|kubernetes)' \
+    "$STRINGS_FILE" 2>/dev/null |
+    sort -u |
+    head -n "$MAX_INTERESTING" > "$INTERESTING_FILE" || true
+
+else
+
+    : > "$INTERESTING_FILE"
+
+fi
 
 INTERESTING_COUNT="$(wc -l < "$INTERESTING_FILE" 2>/dev/null || echo 0)"
 
@@ -516,17 +670,21 @@ if [ "$INTERESTING_COUNT" -gt 0 ]; then
     cat "$INTERESTING_FILE"
 
 else
+
     echo "No obvious interesting-text remnants found."
+
 fi
 
 # ----------------------------------------------------------------------
 # Final result
 # ----------------------------------------------------------------------
 
-section "[10] Result"
+section "[12] Result"
 
 echo "Root source              : $ROOT_SOURCE"
-echo "Filesystem               : ${ROOT_FSTYPE:-unknown}"
+echo "Root filesystem          : ${ROOT_FSTYPE:-unknown}"
+echo "Analysis source          : ${SCAN_SOURCE:-none}"
+echo "Analysis filesystem      : ${SCAN_FSTYPE:-unknown}"
 echo "Unallocated data         : $(human_size "$UNALLOC_SIZE")"
 echo "Deleted entries          : $DELETED_COUNT"
 echo "Readable string records  : $STRING_COUNT"
@@ -538,43 +696,45 @@ if [ "$DELETED_COUNT" -gt 0 ] ||
    [ "$FILENAME_COUNT" -gt 0 ] ||
    [ "$INTERESTING_COUNT" -gt 0 ]; then
 
-    echo "RESULT: POTENTIAL RESIDUAL DATA DETECTED"
+    echo "RESULT: POTENTIAL RECOVERABLE REMNANTS DETECTED"
     echo
-    echo "The filesystem exposed deleted entries and/or"
-    echo "readable data in unallocated filesystem space."
-    echo
-    echo "This is NOT proof of cross-tenant data leakage."
+    echo "Deleted filesystem entries and/or readable data"
+    echo "were identified during the available checks."
 
-else
+elif [ -n "$SCAN_SOURCE" ]; then
 
     echo "RESULT: NO OBVIOUS RECOVERABLE REMNANTS DETECTED"
     echo
     echo "No obvious deleted entries or useful readable strings"
-    echo "were identified by this filesystem-level scan."
+    echo "were identified during the filesystem-level checks."
+
+else
+
+    echo "RESULT: FILESYSTEM-LEVEL RECOVERY CHECK NOT AVAILABLE"
+    echo
+    echo "No directly accessible block filesystem was available"
+    echo "for deleted-entry and unallocated-space analysis."
+    echo "Other applicable checks were completed."
+
 fi
 
 echo
-echo "LIMITATIONS:"
+echo "NOTES:"
 echo
-echo "1. This scanner only sees storage exposed to this VPS."
-echo "2. It cannot inspect provider-side physical storage."
-echo "3. It cannot identify the previous owner of residual data."
-echo "4. A clean result does not prove physical secure erasure."
-echo "5. A positive result does not prove cross-tenant leakage."
-echo "6. Live filesystem analysis can produce incomplete/inconsistent results."
-echo
-echo "For a true cross-tenant test:"
-echo "  VPS A -> write unique canary -> destroy VPS A"
-echo "  VPS B -> search for exact canary"
-echo
-echo "Report: $REPORT"
+echo "1. Results depend on the filesystem and storage layer being analyzed."
+echo "2. Deleted filesystem entries may be stale or already reallocated."
+echo "3. Readable strings in unallocated space are candidates, not proof"
+echo "   of a complete recoverable file."
+echo "4. Live filesystem analysis can produce incomplete or inconsistent results."
+echo "5. Overlay filesystems may hide the underlying storage layer."
+echo "6. An overlay mount cannot itself be analyzed as a normal disk filesystem."
 
 # ----------------------------------------------------------------------
-# Save concise report
+# Save report
 # ----------------------------------------------------------------------
 
 {
-    echo "FILE RECOVERY / STORAGE REMANENCE CHECK"
+    echo "FILE RECOVERY CHECK"
     echo "Version: $VERSION"
     echo "Date: $(date)"
     echo "Host: $(hostname)"
@@ -582,7 +742,10 @@ echo "Report: $REPORT"
     echo "OS: ${PRETTY_NAME:-Unknown}"
     echo
     echo "Root source: $ROOT_SOURCE"
-    echo "Filesystem: ${ROOT_FSTYPE:-unknown}"
+    echo "Root filesystem: ${ROOT_FSTYPE:-unknown}"
+    echo "Analysis source: ${SCAN_SOURCE:-none}"
+    echo "Analysis filesystem: ${SCAN_FSTYPE:-unknown}"
+    echo "Analysis reason: ${SCAN_REASON:-none}"
     echo
     echo "Unallocated data: $UNALLOC_SIZE bytes"
     echo "Deleted entries: $DELETED_COUNT"
@@ -594,22 +757,18 @@ echo "Report: $REPORT"
        [ "$FILENAME_COUNT" -gt 0 ] ||
        [ "$INTERESTING_COUNT" -gt 0 ]; then
 
-        echo "Result: Potential residual data detected."
+        echo "Result: Potential recoverable remnants detected."
+
+    elif [ -n "$SCAN_SOURCE" ]; then
+
+        echo "Result: No obvious recoverable remnants detected."
 
     else
 
-        echo "Result: No obvious recoverable remnants detected."
+        echo "Result: Filesystem-level recovery check not available."
+
     fi
 
     echo
-    echo "This is a filesystem-level test."
-    echo "It does not establish previous ownership or cross-tenant leakage."
-
-} > "$REPORT"
-
-echo
-line
-echo "Scan complete."
-echo "Report saved to:"
-echo "$REPORT"
-line
+    echo "This report contains filesystem-level recovery results."
+} > "$REP
