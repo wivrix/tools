@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # ============================================================
-# FILE RECOVERY CHECK v5.2
+# FILE RECOVERY CHECK v5.3
 #
 # Read-only storage/remnant analysis
 #
@@ -11,28 +11,15 @@
 # Full raw scan:
 #   sudo bash file-recovery-check.sh --full-raw
 #
-# This script:
-#   - inventories exposed block devices
-#   - detects mounted/unmounted filesystems
-#   - handles findmnt subvolume/subpath sources
-#   - discovers LVM logical volumes
-#   - analyzes supported filesystems with Sleuth Kit
-#   - checks deleted filesystem entries
-#   - checks unallocated filesystem space
-#   - analyzes overlayfs visibility
-#   - identifies swap/encrypted/LVM devices
-#   - samples unknown/raw devices safely
-#
 # IMPORTANT:
-#   No filesystem is mounted.
-#   No block device is modified.
+#   This script never mounts or writes to discovered block
+#   devices/filesystems.
 # ============================================================
 
 set -u
 set -o pipefail
 
-VERSION="5.2"
-
+VERSION="5.3"
 FULL_RAW=0
 
 for arg in "$@"; do
@@ -43,34 +30,34 @@ for arg in "$@"; do
         -h|--help)
             cat <<'EOF'
 
-FILE RECOVERY CHECK v5.2
+FILE RECOVERY CHECK v5.3
 
 Usage:
   sudo bash file-recovery-check.sh
   sudo bash file-recovery-check.sh --full-raw
 
 Default:
-  - filesystem analysis
-  - deleted-entry analysis
-  - unallocated-space analysis
+  - complete visible block-device inventory
+  - filesystem signature probing
+  - mounted filesystem discovery
+  - unmounted partition discovery
+  - LVM logical-volume discovery when available
   - overlayfs inspection
-  - LVM discovery
+  - deleted-open inspection
+  - Sleuth Kit filesystem analysis
   - bounded raw-device sampling
 
 --full-raw:
   Fully scan unknown/raw devices.
 
 WARNING:
-  Full raw scanning can take a very long time on multi-TB devices.
-
-The script does not mount or modify discovered storage.
+  Full raw scans can take a very long time on multi-TB devices.
 
 EOF
             exit 0
             ;;
         *)
             echo "Unknown option: $arg"
-            echo "Use --help for usage."
             exit 1
             ;;
     esac
@@ -78,16 +65,16 @@ done
 
 
 # ============================================================
-# GLOBALS
+# WORK AREA
 # ============================================================
 
 WORKDIR="/tmp/file-recovery-check-$$"
-
 mkdir -p "$WORKDIR"
 
 DEVICES_FILE="$WORKDIR/devices.txt"
 TARGETS_FILE="$WORKDIR/targets.txt"
 MOUNTS_FILE="$WORKDIR/mounts.txt"
+
 FINDINGS_FILE="$WORKDIR/findings.txt"
 RAW_FINDINGS_FILE="$WORKDIR/raw-findings.txt"
 ERROR_FILE="$WORKDIR/errors.txt"
@@ -100,12 +87,13 @@ touch \
     "$RAW_FINDINGS_FILE" \
     "$ERROR_FILE"
 
-TOTAL_TARGETS=0
 ANALYZED_TARGETS=0
 UNKNOWN_TARGETS=0
 RAW_TARGETS=0
 
-DELETED_ENTRIES=0
+DELETED_DISK_OBJECTS=0
+DELETED_MEMORY_OBJECTS=0
+
 TEXT_CANDIDATES=0
 RAW_CANDIDATES=0
 
@@ -168,11 +156,11 @@ section() {
 
 
 # ============================================================
-# ROOT CHECK
+# ROOT
 # ============================================================
 
 if [ "$(id -u)" -ne 0 ]; then
-    err "Run with sudo/root."
+    err "Run this script with sudo/root."
     exit 1
 fi
 
@@ -196,7 +184,6 @@ printf "Started : %s\n" "$(date)"
 
 if [ "$FULL_RAW" -eq 1 ]; then
     warn "FULL RAW MODE ENABLED"
-    warn "Unknown devices may require a very long time."
 fi
 
 
@@ -213,7 +200,7 @@ install_missing() {
     command -v blkls >/dev/null 2>&1 || missing+=("sleuthkit")
 
     if [ "${#missing[@]}" -eq 0 ]; then
-        ok "Required analysis commands are available."
+        ok "Core analysis commands are available."
         return
     fi
 
@@ -231,12 +218,16 @@ install_missing() {
             ok "Required packages installed."
 
         else
+
             warn "Automatic installation failed."
-            warn "See: $ERROR_FILE"
+            warn "See $ERROR_FILE"
+
         fi
 
     else
-        warn "apt-get is unavailable."
+
+        warn "apt-get unavailable."
+
     fi
 }
 
@@ -244,28 +235,8 @@ install_missing
 
 
 # ============================================================
-# COMMAND CHECK
+# SLEUTH KIT
 # ============================================================
-
-for cmd in \
-    lsblk \
-    findmnt \
-    blkid \
-    file \
-    strings \
-    dd \
-    awk \
-    sed \
-    grep \
-    sort \
-    uniq \
-    stat \
-    blockdev
-do
-    if ! command -v "$cmd" >/dev/null 2>&1; then
-        warn "Missing command: $cmd"
-    fi
-done
 
 if command -v fls >/dev/null 2>&1 &&
    command -v blkls >/dev/null 2>&1; then
@@ -282,7 +253,7 @@ fi
 
 
 # ============================================================
-# ROOT
+# ROOT FILESYSTEM
 # ============================================================
 
 section "ROOT FILESYSTEM"
@@ -295,7 +266,7 @@ printf "Filesystem  : %s\n" "${ROOT_FSTYPE:-unknown}"
 
 
 # ============================================================
-# NORMALIZE FINDMNT SOURCE
+# HELPERS
 # ============================================================
 
 normalize_source() {
@@ -313,24 +284,11 @@ normalize_source() {
 }
 
 
-# ============================================================
-# DEVICE HELPERS
-# ============================================================
-
-device_is_block() {
-    [ -b "$1" ]
-}
-
-
 device_size_bytes() {
 
     local dev="$1"
 
-    if command -v blockdev >/dev/null 2>&1; then
-        blockdev --getsize64 "$dev" 2>/dev/null || echo 0
-    else
-        echo 0
-    fi
+    blockdev --getsize64 "$dev" 2>/dev/null || echo 0
 }
 
 
@@ -341,15 +299,15 @@ human_size() {
     awk -v b="$bytes" '
     BEGIN {
         if (b >= 1099511627776)
-            printf "%.2f TiB", b/1099511627776
+            printf "%.2f TiB", b/1099511627776;
         else if (b >= 1073741824)
-            printf "%.2f GiB", b/1073741824
+            printf "%.2f GiB", b/1073741824;
         else if (b >= 1048576)
-            printf "%.2f MiB", b/1048576
+            printf "%.2f MiB", b/1048576;
         else if (b >= 1024)
-            printf "%.2f KiB", b/1024
+            printf "%.2f KiB", b/1024;
         else
-            printf "%d B", b
+            printf "%d B", b;
     }'
 }
 
@@ -360,10 +318,12 @@ safe_name() {
 
 
 # ============================================================
-# BLOCK INVENTORY
+# COMPLETE BLOCK DEVICE DISCOVERY
 # ============================================================
 
 section "BLOCK DEVICE INVENTORY"
+
+: > "$DEVICES_FILE"
 
 if command -v lsblk >/dev/null 2>&1; then
 
@@ -373,10 +333,18 @@ if command -v lsblk >/dev/null 2>&1; then
         2>/dev/null || true
 
     echo
+    info "Collecting all visible block devices and partitions..."
 
-    info "Collecting visible block devices..."
+    # IMPORTANT:
+    # Do NOT use lsblk -d here.
+    # -d means "top-level devices only" and hides partitions.
 
-    lsblk -dn -e 7 -o PATH,TYPE 2>/dev/null |
+    lsblk \
+        -r \
+        -n \
+        -e 7 \
+        -o PATH,TYPE \
+        2>/dev/null |
     awk '
         $2=="disk" ||
         $2=="part" ||
@@ -385,42 +353,80 @@ if command -v lsblk >/dev/null 2>&1; then
             print $1
         }
     ' |
-    sort -u |
-    tee "$DEVICES_FILE"
-
-else
-
-    warn "lsblk unavailable."
+    sort -u >> "$DEVICES_FILE"
 
 fi
 
 
-# Add common device names if visible but missing from lsblk.
+# Also inspect common device names directly.
+# This catches devices that lsblk may not list normally.
 
-for d in \
-    /dev/vd[a-z] \
-    /dev/sd[a-z] \
-    /dev/xvd[a-z] \
-    /dev/nvme*n* \
-    /dev/mmcblk*
+for pattern in \
+    "/dev/vd[a-z]" \
+    "/dev/vd[a-z][0-9]*" \
+    "/dev/sd[a-z]" \
+    "/dev/sd[a-z][0-9]*" \
+    "/dev/xvd[a-z]" \
+    "/dev/xvd[a-z][0-9]*" \
+    "/dev/nvme*n*" \
+    "/dev/nvme*n*p*" \
+    "/dev/mmcblk*" \
+    "/dev/mmcblk*p*"
 do
-    if [ -b "$d" ]; then
-        printf '%s\n' "$d" >> "$DEVICES_FILE"
-    fi
+
+    for d in $pattern; do
+
+        if [ -b "$d" ]; then
+            printf '%s\n' "$d" >> "$DEVICES_FILE"
+        fi
+
+    done
+
 done
+
+
+# Device-mapper nodes.
+if [ -d /dev/mapper ]; then
+
+    for d in /dev/mapper/*; do
+
+        if [ -b "$d" ]; then
+            printf '%s\n' "$d" >> "$DEVICES_FILE"
+        fi
+
+    done
+
+fi
+
 
 sort -u "$DEVICES_FILE" -o "$DEVICES_FILE"
 
+printf "\nVisible block devices:\n"
+
+cat "$DEVICES_FILE"
+
+DEVICE_COUNT="$(grep -c '^/dev/' "$DEVICES_FILE" 2>/dev/null || echo 0)"
+
+printf "\nTotal block devices discovered: %s\n" "$DEVICE_COUNT"
+
+
+if [ "$DEVICE_COUNT" -eq 0 ]; then
+
+    err "No block devices were discovered."
+    err "This is a discovery failure, not evidence that storage is clean."
+
+fi
+
 
 # ============================================================
-# DELETED OPEN FILES
+# DELETED-OPEN FILES
 # ============================================================
 
 section "DELETED OPEN FILES"
 
 if command -v lsof >/dev/null 2>&1; then
 
-    start_msg "Checking deleted-open files..."
+    start_msg "Checking deleted-open objects..."
 
     LSOF_OUT="$WORKDIR/lsof.txt"
 
@@ -430,20 +436,54 @@ if command -v lsof >/dev/null 2>&1; then
 
         cat "$LSOF_OUT"
 
-        DELETED_ENTRIES="$(tail -n +2 "$LSOF_OUT" |
-            wc -l |
-            tr -d ' ')"
+        # Examine DEVICE column.
+        #
+        # DEVICE 0,1 is normally memory-backed / virtual.
+        # Do not treat it as persistent disk storage.
 
-        warn "Deleted-open objects: $DELETED_ENTRIES"
-        warn "These may be memory-backed and are not automatically disk remnants."
+        while IFS= read -r line; do
+
+            [ -n "$line" ] || continue
+
+            device_field="$(printf '%s\n' "$line" | awk '{print $5}')"
+
+            case "$device_field" in
+
+                0,1|0,0)
+                    DELETED_MEMORY_OBJECTS=$(
+                        printf '%s' "$DELETED_MEMORY_OBJECTS" |
+                        awk '{print $1+1}'
+                    )
+                    ;;
+
+                *)
+                    DELETED_DISK_OBJECTS=$(
+                        printf '%s' "$DELETED_DISK_OBJECTS" |
+                        awk '{print $1+1}'
+                    )
+                    ;;
+
+            esac
+
+        done < <(tail -n +2 "$LSOF_OUT")
+
+        printf "\nMemory/virtual deleted objects : %s\n" \
+            "$DELETED_MEMORY_OBJECTS"
+
+        printf "Potential disk-backed objects   : %s\n" \
+            "$DELETED_DISK_OBJECTS"
+
+        if [ "$DELETED_DISK_OBJECTS" -gt 0 ]; then
+            warn "Disk-backed deleted-open objects require review."
+        else
+            ok "No disk-backed deleted-open objects detected."
+        fi
 
     else
 
-        ok "No deleted-open files detected."
+        ok "No deleted-open objects detected."
 
     fi
-
-    done_msg "Deleted-open check complete."
 
 else
 
@@ -498,7 +538,6 @@ if [ "$ROOT_FSTYPE" = "overlay" ]; then
     else
 
         warn "Overlay upper directory is not accessible."
-        warn "Overlay storage cannot be considered fully analyzed."
 
     fi
 
@@ -554,7 +593,7 @@ probe_type() {
         return
     }
 
-    # Fast signature probe.
+    # Fast blkid probe.
     out="$(blkid -p -o export "$dev" 2>/dev/null || true)"
 
     type="$(
@@ -568,7 +607,7 @@ probe_type() {
         return
     fi
 
-    # file(1) fallback.
+    # file fallback.
     out="$(file -sL "$dev" 2>/dev/null || true)"
 
     case "$out" in
@@ -632,61 +671,25 @@ add_target() {
 
 
 # ============================================================
-# DISCOVER MOUNTED STORAGE
+# ADD EVERY BLOCK DEVICE
 # ============================================================
 
 section "STORAGE DISCOVERY"
 
 : > "$TARGETS_FILE"
 
-while IFS='|' read -r target source fstype; do
-
-    [ -n "$source" ] || continue
-
-    source="$(normalize_source "$source")"
-
-    if [ -b "$source" ]; then
-
-        detected="$(probe_type "$source")"
-
-        [ "$detected" != "UNKNOWN" ] &&
-            fstype="$detected"
-
-        case "$fstype" in
-
-            swap)
-                add_target "$source" "swap" "$fstype" "$target"
-                ;;
-
-            LVM2_member)
-                add_target "$source" "lvm-pv" "$fstype" "$target"
-                ;;
-
-            crypto_LUKS)
-                add_target "$source" "encrypted" "$fstype" "$target"
-                ;;
-
-            *)
-                add_target "$source" "mounted" "$fstype" "$target"
-                ;;
-
-        esac
-
-    fi
-
-done < "$MOUNTS_FILE"
-
-
-# ============================================================
-# DISCOVER BLOCK DEVICES
-# ============================================================
+start_msg "Probing every visible block device..."
 
 while IFS= read -r dev; do
 
     [ -n "$dev" ] || continue
     [ -b "$dev" ] || continue
 
+    printf "[PROBE] %-30s " "$dev"
+
     fstype="$(probe_type "$dev")"
+
+    printf "%s\n" "$fstype"
 
     case "$fstype" in
 
@@ -713,6 +716,39 @@ while IFS= read -r dev; do
     esac
 
 done < "$DEVICES_FILE"
+
+done_msg "Block-device probing complete."
+
+
+# ============================================================
+# MOUNTED DEVICE SOURCES
+# ============================================================
+
+start_msg "Adding mounted block-device sources..."
+
+while IFS='|' read -r target source fstype; do
+
+    source="$(normalize_source "$source")"
+
+    if [ -b "$source" ]; then
+
+        detected="$(probe_type "$source")"
+
+        if [ "$detected" != "UNKNOWN" ]; then
+            fstype="$detected"
+        fi
+
+        add_target \
+            "$source" \
+            "mounted" \
+            "$fstype" \
+            "$target"
+
+    fi
+
+done < "$MOUNTS_FILE"
+
+done_msg "Mounted storage discovery complete."
 
 
 # ============================================================
@@ -749,15 +785,32 @@ if command -v lvs >/dev/null 2>&1; then
         sed 's/^ *//;s/ *$//'
     )
 
-    if [ "$LVM_COUNT" -gt 0 ]; then
-        ok "LVM logical volumes discovered: $LVM_COUNT"
-    else
-        info "No active LVM logical volumes discovered."
-    fi
+    printf "LVM logical volumes: %s\n" "$LVM_COUNT"
 
 else
 
-    info "lvs command unavailable."
+    info "lvs command unavailable; using device-mapper discovery."
+
+    if [ -d /dev/mapper ]; then
+
+        for dev in /dev/mapper/*; do
+
+            [ -b "$dev" ] || continue
+
+            # Skip control node.
+            [ "$(basename "$dev")" = "control" ] && continue
+
+            fstype="$(probe_type "$dev")"
+
+            add_target \
+                "$dev" \
+                "device-mapper" \
+                "$fstype" \
+                "/dev/mapper"
+
+        done
+
+    fi
 
 fi
 
@@ -769,10 +822,8 @@ fi
 section "SWAP"
 
 if [ -r /proc/swaps ]; then
-    cat /proc/swaps
-fi
 
-if [ -r /proc/swaps ]; then
+    cat /proc/swaps
 
     while read -r filename type size used priority; do
 
@@ -780,7 +831,13 @@ if [ -r /proc/swaps ]; then
         [ -n "${filename:-}" ] || continue
 
         if [ -b "$filename" ]; then
-            add_target "$filename" "swap" "swap" "active-swap"
+
+            add_target \
+                "$filename" \
+                "swap" \
+                "swap" \
+                "active-swap"
+
         fi
 
     done < /proc/swaps
@@ -801,15 +858,15 @@ sort -t'|' -k1,1 -u "$TARGETS_FILE" -o "$TARGETS_FILE"
 
 section "DISCOVERED STORAGE TARGETS"
 
-printf "%-38s %-12s %-18s %s\n" \
+printf "%-38s %-16s %-18s %s\n" \
     "DEVICE" \
     "TYPE" \
     "FILESYSTEM" \
     "SOURCE"
 
-printf "%-38s %-12s %-18s %s\n" \
+printf "%-38s %-16s %-18s %s\n" \
     "--------------------------------------" \
-    "------------" \
+    "----------------" \
     "------------------" \
     "----------------"
 
@@ -817,7 +874,7 @@ while IFS='|' read -r dev type fstype source; do
 
     size="$(device_size_bytes "$dev")"
 
-    printf "%-38s %-12s %-18s %s (%s)\n" \
+    printf "%-38s %-16s %-18s %s (%s)\n" \
         "$dev" \
         "$type" \
         "$fstype" \
@@ -826,9 +883,22 @@ while IFS='|' read -r dev type fstype source; do
 
 done < "$TARGETS_FILE"
 
+TARGET_COUNT="$(
+    grep -c '^/dev/' "$TARGETS_FILE" 2>/dev/null || echo 0
+)"
+
+printf "\nTotal analysis targets: %s\n" "$TARGET_COUNT"
+
+if [ "$TARGET_COUNT" -eq 0 ]; then
+
+    err "DISCOVERY ERROR: zero storage targets were created."
+    err "The script will not report this environment as clean."
+
+fi
+
 
 # ============================================================
-# STRING EXTRACTION
+# INTERESTING STRING EXTRACTION
 # ============================================================
 
 extract_candidates() {
@@ -857,18 +927,15 @@ analyze_filesystem() {
     local fstype="$3"
     local source="$4"
 
-    TOTAL_TARGETS=$((TOTAL_TARGETS + 1))
-
-    section "FILESYSTEM ANALYSIS: $dev"
+    section "ANALYZING $dev"
 
     printf "Device     : %s\n" "$dev"
     printf "Type       : %s\n" "$type"
     printf "Filesystem : %s\n" "$fstype"
     printf "Source     : %s\n" "$source"
+    printf "Size       : %s\n" \
+        "$(human_size "$(device_size_bytes "$dev")")"
 
-    size="$(device_size_bytes "$dev")"
-
-    printf "Size       : %s\n" "$(human_size "$size")"
 
     case "$fstype" in
 
@@ -876,7 +943,7 @@ analyze_filesystem() {
 
             if [ "$SLEUTHKIT" -eq 0 ]; then
 
-                warn "Sleuth Kit unavailable."
+                warn "$dev: Sleuth Kit unavailable."
                 UNKNOWN_TARGETS=$((UNKNOWN_TARGETS + 1))
                 return
 
@@ -890,23 +957,24 @@ analyze_filesystem() {
             BLKLS_OUT="$WORKDIR/blkls-$base.bin"
             STRINGS_OUT="$WORKDIR/strings-$base.txt"
 
+
             # ------------------------------------------------
             # Deleted entries
             # ------------------------------------------------
 
-            start_msg "$dev: deleted-entry analysis"
+            start_msg "$dev: deleted filesystem entries"
 
             if fls -r -d -p "$dev" \
                 > "$FLS_OUT" \
                 2>>"$ERROR_FILE"; then
 
-                deleted_count="$(
+                count="$(
                     grep -c . "$FLS_OUT" 2>/dev/null || echo 0
                 )"
 
-                if [ "$deleted_count" -gt 0 ]; then
+                if [ "$count" -gt 0 ]; then
 
-                    warn "Deleted filesystem entries: $deleted_count"
+                    warn "$dev: deleted entries = $count"
 
                     {
                         echo
@@ -916,20 +984,15 @@ analyze_filesystem() {
                         head -n 500 "$FLS_OUT"
                     } >> "$FINDINGS_FILE"
 
-                    DELETED_ENTRIES=$(
-                        printf '%s' "$DELETED_ENTRIES" |
-                        awk -v x="$deleted_count" '{print $1+x}'
-                    )
-
                 else
 
-                    ok "$dev: no deleted filesystem entries reported."
+                    ok "$dev: no deleted entries reported."
 
                 fi
 
             else
 
-                warn "$dev: fls analysis failed."
+                warn "$dev: fls failed."
 
             fi
 
@@ -940,7 +1003,7 @@ analyze_filesystem() {
             # Unallocated space
             # ------------------------------------------------
 
-            start_msg "$dev: unallocated-space analysis"
+            start_msg "$dev: unallocated filesystem space"
 
             if blkls "$dev" > "$BLKLS_OUT" 2>>"$ERROR_FILE"; then
 
@@ -957,31 +1020,32 @@ analyze_filesystem() {
                         "$BLKLS_OUT" \
                         "$STRINGS_OUT"
 
-                    candidate_count="$(
+                    count="$(
                         wc -l < "$STRINGS_OUT" |
                         tr -d ' '
                     )"
 
-                    if [ "${candidate_count:-0}" -gt 0 ]; then
+                    if [ "${count:-0}" -gt 0 ]; then
 
-                        warn "Potential interesting strings: $candidate_count"
+                        warn "$dev: potential interesting strings = $count"
 
                         {
                             echo
                             echo "DEVICE: $dev"
                             echo "FILESYSTEM: $fstype"
-                            echo "POTENTIAL STRINGS FROM UNALLOCATED SPACE:"
+                            echo "POTENTIAL STRINGS:"
                             cat "$STRINGS_OUT"
                         } >> "$FINDINGS_FILE"
 
                         TEXT_CANDIDATES=$(
-                            printf '%s' "$TEXT_CANDIDATES" |
-                            awk -v x="$candidate_count" '{print $1+x}'
+                            awk -v a="$TEXT_CANDIDATES" \
+                                -v b="$count" \
+                                'BEGIN {print a+b}'
                         )
 
                     else
 
-                        ok "$dev: no configured interesting strings found."
+                        ok "$dev: no configured interesting strings."
 
                     fi
 
@@ -1007,7 +1071,7 @@ analyze_filesystem() {
         swap)
 
             info "$dev: swap detected."
-            info "Swap is not analyzed as a normal filesystem."
+            info "Swap is not treated as a normal filesystem."
 
             RAW_TARGETS=$((RAW_TARGETS + 1))
 
@@ -1016,8 +1080,8 @@ analyze_filesystem() {
 
         LVM2_member)
 
-            info "$dev: LVM physical volume detected."
-            info "Analyzing active logical volumes instead."
+            info "$dev: LVM physical volume."
+            info "Physical volume itself is not a normal filesystem."
 
             UNKNOWN_TARGETS=$((UNKNOWN_TARGETS + 1))
 
@@ -1026,8 +1090,7 @@ analyze_filesystem() {
 
         crypto_LUKS)
 
-            warn "$dev: encrypted storage detected."
-            warn "Contents cannot be analyzed without the appropriate mapping."
+            warn "$dev: encrypted LUKS storage."
 
             UNKNOWN_TARGETS=$((UNKNOWN_TARGETS + 1))
 
@@ -1036,7 +1099,7 @@ analyze_filesystem() {
 
         UNKNOWN|"")
 
-            warn "$dev: filesystem type unknown."
+            warn "$dev: unknown filesystem signature."
 
             UNKNOWN_TARGETS=$((UNKNOWN_TARGETS + 1))
 
@@ -1045,7 +1108,7 @@ analyze_filesystem() {
 
         *)
 
-            warn "$dev: unsupported filesystem type: $fstype"
+            warn "$dev: unsupported filesystem: $fstype"
 
             UNKNOWN_TARGETS=$((UNKNOWN_TARGETS + 1))
 
@@ -1066,7 +1129,7 @@ analyze_raw() {
     local fstype="$3"
     local source="$4"
 
-    section "RAW / UNKNOWN ANALYSIS: $dev"
+    section "RAW / UNKNOWN: $dev"
 
     printf "Device    : %s\n" "$dev"
     printf "Type      : %s\n" "$type"
@@ -1087,6 +1150,7 @@ analyze_raw() {
 
     SAMPLE_SIZE=$((64 * 1024 * 1024))
 
+
     # --------------------------------------------------------
     # FULL RAW
     # --------------------------------------------------------
@@ -1094,9 +1158,7 @@ analyze_raw() {
     if [ "$FULL_RAW" -eq 1 ]; then
 
         warn "$dev: FULL RAW SCAN"
-        warn "Size: $(human_size "$size")"
-
-        start_msg "$dev: starting full raw scan"
+        start_msg "$dev: full raw scan"
 
         if dd \
             if="$dev" \
@@ -1116,7 +1178,7 @@ analyze_raw() {
 
             if [ "$count" -gt 0 ]; then
 
-                warn "$dev: raw candidates: $count"
+                warn "$dev: raw candidates = $count"
 
                 {
                     echo
@@ -1128,8 +1190,9 @@ analyze_raw() {
                 } >> "$RAW_FINDINGS_FILE"
 
                 RAW_CANDIDATES=$(
-                    printf '%s' "$RAW_CANDIDATES" |
-                    awk -v x="$count" '{print $1+x}'
+                    awk -v a="$RAW_CANDIDATES" \
+                        -v b="$count" \
+                        'BEGIN {print a+b}'
                 )
 
             else
@@ -1140,7 +1203,7 @@ analyze_raw() {
 
         else
 
-            warn "$dev: full raw scan failed."
+            warn "$dev: raw scan failed."
 
         fi
 
@@ -1151,19 +1214,19 @@ analyze_raw() {
 
 
     # --------------------------------------------------------
-    # BOUNDED SAMPLE
-    #
-    # Efficient reads:
-    # 64 MiB from beginning
-    # 64 MiB from end
-    #
-    # No bs=1.
+    # BOUNDED RAW SAMPLE
     # --------------------------------------------------------
 
     info "$dev: bounded raw sample"
-    info "Reading 64 MiB from beginning..."
+    info "Beginning: 64 MiB"
+    info "End:       64 MiB"
 
     rm -f "$SAMPLE" "$END_SAMPLE"
+
+
+    # Beginning
+
+    start_msg "$dev: reading beginning"
 
     if dd \
         if="$dev" \
@@ -1174,28 +1237,25 @@ analyze_raw() {
         status=progress \
         2>"$WORKDIR/dd-start-$base.log"; then
 
-        done_msg "$dev: beginning sample complete."
+        done_msg "$dev: beginning read complete."
 
     else
 
-        warn "$dev: beginning sample failed."
+        warn "$dev: beginning read failed."
 
     fi
 
 
-    # --------------------------------------------------------
-    # End sample
-    # --------------------------------------------------------
+    # End
 
     if [ "$size" -gt "$SAMPLE_SIZE" ]; then
 
-        offset=$((size - SAMPLE_SIZE))
+        skip_mb=$(
+            awk -v size="$size" -v sample="$SAMPLE_SIZE" \
+                'BEGIN {printf "%d", (size-sample)/1048576}'
+        )
 
-        info "$dev: reading 64 MiB from end..."
-
-        # Efficient seek:
-        # seek in 1 MiB blocks rather than bs=1.
-        skip_mb=$((offset / 1048576))
+        start_msg "$dev: reading end"
 
         if dd \
             if="$dev" \
@@ -1207,32 +1267,25 @@ analyze_raw() {
             status=progress \
             2>"$WORKDIR/dd-end-$base.log"; then
 
-            done_msg "$dev: end sample complete."
+            done_msg "$dev: end read complete."
 
         else
 
-            warn "$dev: end sample failed."
+            warn "$dev: end read failed."
 
         fi
-
-    else
-
-        info "$dev: device smaller than 64 MiB; end sample skipped."
 
     fi
 
 
-    # --------------------------------------------------------
-    # Analyze samples
-    # --------------------------------------------------------
+    # Analyze
 
-    cat "$SAMPLE" "$END_SAMPLE" \
-        2>/dev/null |
-        strings -a -n 8 |
-        grep -Ei \
-            'password|passwd|username|authorization|bearer |api[_-]?key|secret|private[_-]?key|access[_-]?token|refresh[_-]?token|database|mysql|postgres|mongodb|redis|ssh-rsa|BEGIN .*PRIVATE KEY|AWS_ACCESS_KEY|AWS_SECRET|github[_-]?token|credit.?card' |
-        sed 's/^[[:space:]]*//' |
-        head -n 500 > "$OUTPUT" || true
+    cat "$SAMPLE" "$END_SAMPLE" 2>/dev/null |
+    strings -a -n 8 |
+    grep -Ei \
+        'password|passwd|username|authorization|bearer |api[_-]?key|secret|private[_-]?key|access[_-]?token|refresh[_-]?token|database|mysql|postgres|mongodb|redis|ssh-rsa|BEGIN .*PRIVATE KEY|AWS_ACCESS_KEY|AWS_SECRET|github[_-]?token|credit.?card' |
+    sed 's/^[[:space:]]*//' |
+    head -n 500 > "$OUTPUT" || true
 
     count="$(
         wc -l < "$OUTPUT" 2>/dev/null |
@@ -1241,7 +1294,7 @@ analyze_raw() {
 
     if [ "${count:-0}" -gt 0 ]; then
 
-        warn "$dev: potential raw-data candidates: $count"
+        warn "$dev: potential raw candidates = $count"
 
         {
             echo
@@ -1253,8 +1306,9 @@ analyze_raw() {
         } >> "$RAW_FINDINGS_FILE"
 
         RAW_CANDIDATES=$(
-            printf '%s' "$RAW_CANDIDATES" |
-            awk -v x="$count" '{print $1+x}'
+            awk -v a="$RAW_CANDIDATES" \
+                -v b="$count" \
+                'BEGIN {print a+b}'
         )
 
     else
@@ -1270,7 +1324,7 @@ analyze_raw() {
 
 
 # ============================================================
-# PROCESS TARGETS
+# RUN ANALYSIS
 # ============================================================
 
 section "STORAGE ANALYSIS"
@@ -1330,10 +1384,12 @@ fi
 
 section "RESULTS"
 
-printf "Filesystem targets analyzed : %s\n" "$ANALYZED_TARGETS"
+printf "Analysis targets             : %s\n" "$TARGET_COUNT"
+printf "Filesystems analyzed        : %s\n" "$ANALYZED_TARGETS"
 printf "Unknown/unanalyzable        : %s\n" "$UNKNOWN_TARGETS"
 printf "Raw targets inspected       : %s\n" "$RAW_TARGETS"
-printf "Deleted entries             : %s\n" "$DELETED_ENTRIES"
+printf "Disk-backed deleted objects : %s\n" "$DELETED_DISK_OBJECTS"
+printf "Memory-backed deleted objs  : %s\n" "$DELETED_MEMORY_OBJECTS"
 printf "Interesting-text candidates : %s\n" "$TEXT_CANDIDATES"
 printf "Raw-data candidates         : %s\n" "$RAW_CANDIDATES"
 
@@ -1344,39 +1400,39 @@ printf "Raw-data candidates         : %s\n" "$RAW_CANDIDATES"
 
 section "FINAL STATUS"
 
-if [ "$TEXT_CANDIDATES" -gt 0 ] ||
-   [ "$RAW_CANDIDATES" -gt 0 ] ||
-   [ "$DELETED_ENTRIES" -gt 0 ]; then
+if [ "$TARGET_COUNT" -eq 0 ]; then
 
-    warn "RESULT: POTENTIAL REMNANTS DETECTED"
+    err "RESULT: STORAGE DISCOVERY FAILED"
+    echo
+    echo "No block-device/filesystem targets were created."
+    echo "This result must not be interpreted as clean storage."
+
+elif [ "$TEXT_CANDIDATES" -gt 0 ] ||
+     [ "$RAW_CANDIDATES" -gt 0 ] ||
+     [ "$DELETED_DISK_OBJECTS" -gt 0 ]; then
+
+    warn "RESULT: POTENTIAL STORAGE REMNANTS DETECTED"
 
     echo
     echo "Review the evidence above."
-    echo
     echo "Generic strings are not proof of another environment's data."
-    echo "A unique controlled canary provides substantially stronger evidence."
+    echo "Controlled unique canary evidence is substantially stronger."
 
 elif [ "$UNKNOWN_TARGETS" -gt 0 ]; then
 
     warn "RESULT: STORAGE PRESENT BUT NOT FULLY ANALYZABLE"
 
     echo
-    echo "One or more storage targets were exposed but could not be"
-    echo "fully analyzed."
-    echo
-    echo "Do not interpret this result as proof that the storage is clean."
-
-elif [ "$ANALYZED_TARGETS" -eq 0 ]; then
-
-    warn "RESULT: NO FILESYSTEM ANALYSIS AVAILABLE"
+    echo "One or more exposed storage targets could not be fully analyzed."
+    echo "This must not be reported as proof that storage is clean."
 
 else
 
-    ok "RESULT: ANALYZED STORAGE - NO OBVIOUS REMNANTS DETECTED"
+    ok "RESULT: ANALYZED STORAGE - NO CONFIGURED REMNANTS DETECTED"
 
     echo
-    echo "No configured remnants were found in the analyzed areas."
-    echo "This does not prove that every underlying physical byte is clean."
+    echo "The analyzed storage did not produce configured findings."
+    echo "This does not prove physical storage sanitization."
 
 fi
 
@@ -1389,48 +1445,49 @@ section "INTERPRETATION"
 
 cat <<'EOF'
 
-This is a read-only storage analysis.
+This tool performs read-only analysis of storage exposed to the
+current environment.
 
-The following distinctions are important:
+Important:
 
 - A visible block device is not itself proof of a vulnerability.
 
 - A deleted filename is not necessarily recoverable file content.
 
-- Generic strings in unallocated/raw storage do not prove that the
-  data originated from another environment.
+- Generic strings in raw/unallocated storage do not prove that
+  the data came from another environment.
 
 - A unique controlled canary is stronger evidence.
 
-- If a controlled canary created in one environment is later
-  recoverable from storage exposed to another environment, preserve:
+For controlled remanence testing, preserve:
 
-    * exact canary value
-    * creation timestamp
-    * release/destruction timestamp
-    * new environment creation timestamp
-    * exact device/offset/path
-    * recovered evidence
-    * hashes where applicable
+  * exact canary value
+  * creation timestamp
+  * release/destruction timestamp
+  * new environment creation timestamp
+  * exact device/path/offset
+  * recovered evidence
+  * hashes where applicable
 
-- "No findings" does not prove physical storage sanitization.
+"No findings" does not prove that every underlying physical byte
+was sanitized.
 
-- Virtualization, snapshots, copy-on-write, RAID, encryption,
-  network storage, and inaccessible storage layers can prevent
-  complete inspection from inside an environment.
+Virtualization, snapshots, copy-on-write, RAID, encryption,
+network storage and inaccessible storage layers may prevent
+complete inspection from inside the environment.
 
-- The script does not attempt to bypass encryption or obtain keys.
+This tool does not attempt to bypass encryption or obtain keys.
 
 EOF
 
 
 # ============================================================
-# TARGET SUMMARY
+# FINAL TARGET SUMMARY
 # ============================================================
 
 section "TARGET SUMMARY"
 
-printf "%-38s %-12s %-18s %s\n" \
+printf "%-38s %-16s %-18s %s\n" \
     "DEVICE" \
     "TYPE" \
     "FILESYSTEM" \
@@ -1438,7 +1495,7 @@ printf "%-38s %-12s %-18s %s\n" \
 
 while IFS='|' read -r dev type fstype source; do
 
-    printf "%-38s %-12s %-18s %s\n" \
+    printf "%-38s %-16s %-18s %s\n" \
         "$dev" \
         "$type" \
         "$fstype" \
